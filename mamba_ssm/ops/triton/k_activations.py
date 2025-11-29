@@ -60,6 +60,27 @@ def _swiglu_fwd(xy, out=None):
     return out.reshape(*batch_shape, out.shape[-1])
 
 
+
+def _reglu_fwd(xy):
+    x, y = xy.chunk(2, dim=-1)
+    out = x.clamp(min=0) * y
+    return out
+
+def _reglu_bwd(xy, dout, dxy=None, recompute_output=False, out=None):
+    x, y = xy.chunk(2, dim=-1)
+    if dxy is None:
+        dxy = torch.empty_like(xy)
+    dx, dy = dxy.chunk(2, dim=-1)
+    dx.copy_((x > 0).to(dout.dtype) * y * dout)
+    dy.copy_(x.clamp(min=0) * dout)
+    if recompute_output:
+        if out is None:
+            out = torch.empty_like(x)
+        out.copy_(x.clamp(min=0) * y)
+        return dxy, out
+    return dxy
+
+
 @triton.autotune(
     configs=[
         triton.Config({'BLOCK_N': 32}),
@@ -166,4 +187,23 @@ class SwiGLU(torch.autograd.Function):
         return _swiglu_bwd(xy, dout)
 
 
+
+class ReGlu(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, xy):
+        ctx.save_for_backward(xy)
+        x, y = xy.chunk(2, dim=-1)
+        out = x.clamp(min=0) * y
+        return out
+
+    @staticmethod
+    def backward(ctx, dout):
+        xy, = ctx.saved_tensors
+        x, y = xy.chunk(2, dim=-1)
+        dx = (x > 0).to(dout.dtype) * y * dout
+        dy = x.clamp(min=0) * dout
+        return torch.cat([dx, dy], dim=-1)
+
 swiglu = SwiGLU.apply
+reglu = ReGlu.apply

@@ -41,7 +41,7 @@ from mamba_ssm.ops.triton.ssd_chunk_scan import _chunk_scan_bwd_ddAcs_stable
 from mamba_ssm.ops.triton.ssd_chunk_scan import chunk_scan, chunk_scan_ref
 from mamba_ssm.ops.triton.ssd_chunk_scan import _chunk_scan_bwd_ddAcs_prev
 from mamba_ssm.ops.triton.layernorm_gated import rmsnorm_fn, _layer_norm_fwd, _layer_norm_bwd
-from mamba_ssm.ops.triton.k_activations import _swiglu_fwd, _swiglu_bwd
+from mamba_ssm.ops.triton.k_activations import _swiglu_fwd, _swiglu_bwd, _reglu_fwd, _reglu_bwd
 
 TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
 
@@ -771,7 +771,7 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
     def forward(ctx, zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states=None, seq_idx=None, dt_limit=(0.0, float("inf")), return_final_states=False, activation="silu",
                 rmsnorm_weight=None, rmsnorm_eps=1e-6, outproj_weight=None, outproj_bias=None, headdim=None,
                 ngroups=1, norm_before_gate=True):
-        assert activation in [None, "silu", "swish"]
+        # assert activation in [None, "silu", "swish", "relu"]
         if D.dim() == 1:
             assert headdim is not None
             nheads, = D.shape
@@ -790,7 +790,7 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
         seq_idx = seq_idx.contiguous() if seq_idx is not None else None
         xBC_conv = rearrange(
             causal_conv1d_fwd_function(rearrange_and_update_stride(xBC, "b s d -> b d s"),
-                                                 conv1d_weight, conv1d_bias, seq_idx, None, None, activation in ["silu", "swish"]),
+                                                 conv1d_weight, conv1d_bias, seq_idx, None, None, activation),
             "b d s -> b s d"
         )
         x, B, C = torch.split(xBC_conv, [dim, ngroups * dstate, ngroups * dstate], dim=-1)
@@ -803,7 +803,10 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
             out = rearrange(out, "b s h p -> b s (h p)")
             rstd = None
             if d_nonssm > 0:
-                out = torch.cat([_swiglu_fwd(zx0), out], dim=-1)
+                if activation in ["silu", "swish"]:
+                    out = torch.cat([_swiglu_fwd(zx0), out], dim=-1)
+                else:
+                    out = torch.cat([_reglu_fwd(zx0), out], dim=-1)
         else:
             out_x, _, dt_out, dA_cumsum, states, final_states = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size=chunk_size, D=D, z=None, dt_bias=dt_bias, initial_states=initial_states, seq_idx=seq_idx, dt_softplus=True, dt_limit=dt_limit)
             # reshape input data into 2D tensor
@@ -815,7 +818,11 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
             else:
                 out01 = torch.empty((batch, seqlen, d_nonssm + dim), dtype=x_rms.dtype, device=x_rms.device)
                 out = rearrange(out01[..., d_nonssm:], "b s d -> (b s) d")
-                _swiglu_fwd(zx0, out=out01[..., :d_nonssm])
+                if activation == "silu" or activation == "swish":
+                    out01[..., :d_nonssm] = _swiglu_fwd(zx0, out=out01[..., :d_nonssm])
+                elif activation == "relu":
+                    out01[..., :d_nonssm] = _reglu_fwd(zx0, out=out01[..., :d_nonssm])
+                    
             out, _, rstd = _layer_norm_fwd(x_rms, rmsnorm_weight, None, rmsnorm_eps, z_rms, out=out,
                                            group_size=dim // ngroups,
                                            norm_before_gate=norm_before_gate, is_rms_norm=True)
@@ -864,7 +871,7 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
         # Recompute x, B, C
         xBC_conv = rearrange(
             causal_conv1d_fwd_function(rearrange_and_update_stride(xBC, "b s d -> b d s"),
-                                       conv1d_weight, conv1d_bias, seq_idx, None, None, ctx.activation in ["silu", "swish"]),
+                                       conv1d_weight, conv1d_bias, seq_idx, None, None, ctx.activation),
             "b d s -> b s d"
         )
         x, B, C = torch.split(xBC_conv, [dim, ctx.ngroups * dstate, ctx.ngroups * dstate], dim=-1)
@@ -884,7 +891,11 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
             dout = F.linear(dout, outproj_weight.t())
         if d_nonssm > 0:
             dout0, dout = dout.split([d_nonssm, dim], dim=-1)
-            _swiglu_bwd(zx0, dout0, dxy=dzx0, recompute_output=True, out=out0_recompute)
+            if ctx.activation in ["silu", "swish"]:
+                _swiglu_bwd(zx0, dout0, dxy=dzx0, recompute_output=True, out=out0_recompute)
+            elif ctx.activation == "relu":
+                _reglu_bwd(zx0, dout0, dxy=dzx0, recompute_output=True, out=out0_recompute)
+        
         dout = rearrange(dout, "b s (h p) -> b s h p", p=headdim)
         if rmsnorm_weight is None:
             dz = rearrange(dz, "b l (h p) -> b l h p", h=nheads)
@@ -915,7 +926,7 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
         dxBC_given = rearrange(dxBC_given, "b s d -> b d s")
         dxBC_given_update, dweight, dbias, *_ = causal_conv1d_bwd_function(
             rearrange_and_update_stride(xBC, "b s d -> b d s"), conv1d_weight, conv1d_bias,
-            rearrange(dxBC, "b s d -> b d s"), seq_idx, None, None, rearrange_and_update_stride(dxBC_given), False, ctx.activation in ["silu", "swish"]
+            rearrange(dxBC, "b s d -> b d s"), seq_idx, None, None, rearrange_and_update_stride(dxBC_given), False, ctx.activation
         )
         if dxBC_given.stride() != dxBC_given_update.stride():
             dxBC_given.copy_(dxBC_given_update)
