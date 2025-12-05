@@ -125,8 +125,16 @@ def _selective_scan_update_kernel(
     state = state * dA + dB * x[:, None]
     tl.store(state_ptrs, state, mask=(offs_m[:, None] < dim) & (offs_n[None, :] < dstate))
     out = tl.sum(state * C[None, :], axis=1)
+    # apply relu or clipped identity on this
+    
+    # see how to report the level of sparsity in this
+    # one way to do this is to pass the sparsity level pointer as a parameter to the function
+    # and then return from the calling function
     if HAS_D:
         out += x * D
+        
+    # applied relu here
+    out = tl.relu(out)
     if HAS_Z:
         out *= z * tl.sigmoid(z)
     tl.store(out_ptrs, out, mask=offs_m < dim)
@@ -218,6 +226,9 @@ def selective_state_update(state, x, dt, A, B, C, D=None, z=None, dt_bias=None, 
         )
     if not has_heads:
         out = out.squeeze(1)
+        
+    # then modify here and also return sparsity level
+    # you can pass a the sparsity variable and then check if it is not None
     return out
 
 

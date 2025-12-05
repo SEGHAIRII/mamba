@@ -147,8 +147,13 @@ def _chunk_scan_fwd_kernel(
         dt_ptrs += BLOCK_SIZE_K * stride_dt_csize
         dA_cumsum_ptrs += BLOCK_SIZE_K * stride_dA_cs_csize
 
+
+
+    # this is hard coded for now, modify later, relufy y
     offs_out_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_out_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+
+    acc = tl.where(acc > 0.0, acc, 0.0)
 
     if HAS_D:
         if D_HAS_HDIM:
@@ -402,12 +407,15 @@ def _chunk_scan_bwd_dz_kernel(
     out = tl.load(out_ptrs, mask=(offs_m[:, None] < chunk_size_limit) & (offs_n[None, :] < hdim), other=0.0).to(tl.float32)
     z = tl.load(z_ptrs, mask=(offs_m[:, None] < chunk_size_limit) & (offs_n[None, :] < hdim), other=0.0).to(tl.float32)
     z_sigmoid = tl.sigmoid(z)
+    # modify it here for relu
+    relu_mask = out > 0.0
     if RECOMPUTE_OUTPUT:
         outz = out * z * z_sigmoid
         tl.store(outz_ptrs, outz, mask=(offs_m[:, None] < chunk_size_limit) & (offs_n[None, :] < hdim))
     dz = dout * out * z_sigmoid * (1 + z * (1 - z_sigmoid))
     tl.store(dz_ptrs, dz, mask=(offs_m[:, None] < chunk_size_limit) & (offs_n[None, :] < hdim))
     dout *= z * z_sigmoid
+    dout = tl.where(relu_mask, dout, 0.0)
     tl.store(dout_x_ptrs, dout, mask=(offs_m[:, None] < chunk_size_limit) & (offs_n[None, :] < hdim))
     if HAS_D:
         x = tl.load(x_ptrs, mask=(offs_m[:, None] < chunk_size_limit) & (offs_n[None, :] < hdim), other=0.0).to(tl.float32)
@@ -1754,6 +1762,9 @@ class ChunkScanFn(torch.autograd.Function):
             dz, dout, dD, ddA_cumsum = _chunk_scan_bwd_dz(x, z, out, dout, chunk_size=chunk_size, D=D)
         else:
             dz = None
+            # Added relu here
+            relu_mask = out > 0.0
+            dout = dout * relu_mask
         dprev_states = _chunk_scan_bwd_dstates(C, dA_cumsum, dout, dtype=prev_states.dtype)
         dC = _chunk_scan_bwd_dC(prev_states, dA_cumsum, dout, ngroups=ngroups)
         dC = dC.to(C.dtype)

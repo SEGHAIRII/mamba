@@ -790,7 +790,7 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
         seq_idx = seq_idx.contiguous() if seq_idx is not None else None
         xBC_conv = rearrange(
             causal_conv1d_fwd_function(rearrange_and_update_stride(xBC, "b s d -> b d s"),
-                                                 conv1d_weight, conv1d_bias, seq_idx, None, None, activation),
+                                                 conv1d_weight, conv1d_bias, seq_idx, None, None, True if activation in ["silu", "swish"] else None),
             "b d s -> b s d"
         )
         x, B, C = torch.split(xBC_conv, [dim, ngroups * dstate, ngroups * dstate], dim=-1)
@@ -871,7 +871,7 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
         # Recompute x, B, C
         xBC_conv = rearrange(
             causal_conv1d_fwd_function(rearrange_and_update_stride(xBC, "b s d -> b d s"),
-                                       conv1d_weight, conv1d_bias, seq_idx, None, None, ctx.activation),
+                                       conv1d_weight, conv1d_bias, seq_idx, None, None, True if ctx.activation in ["silu", "swish"] else False),
             "b d s -> b s d"
         )
         x, B, C = torch.split(xBC_conv, [dim, ctx.ngroups * dstate, ctx.ngroups * dstate], dim=-1)
@@ -926,7 +926,7 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
         dxBC_given = rearrange(dxBC_given, "b s d -> b d s")
         dxBC_given_update, dweight, dbias, *_ = causal_conv1d_bwd_function(
             rearrange_and_update_stride(xBC, "b s d -> b d s"), conv1d_weight, conv1d_bias,
-            rearrange(dxBC, "b s d -> b d s"), seq_idx, None, None, rearrange_and_update_stride(dxBC_given), False, ctx.activation
+            rearrange(dxBC, "b s d -> b d s"), seq_idx, None, None, rearrange_and_update_stride(dxBC_given), False, True if ctx.activation in ["silu", "swish"] else False
         )
         if dxBC_given.stride() != dxBC_given_update.stride():
             dxBC_given.copy_(dxBC_given_update)
