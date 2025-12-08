@@ -153,7 +153,6 @@ def _chunk_scan_fwd_kernel(
     offs_out_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_out_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
 
-    acc = tl.where(acc > 0.0, acc, 0.0)
 
     if HAS_D:
         if D_HAS_HDIM:
@@ -163,6 +162,11 @@ def _chunk_scan_fwd_kernel(
         x_residual = tl.load(x_ptr + (offs_m[:, None] * stride_x_seqlen + offs_n[None, :] * stride_x_hdim),
                              mask=(offs_m[:, None] < chunk_size_limit) & (offs_n[None, :] < hdim), other=0.0).to(tl.float32)
         acc += x_residual * D
+        
+        
+   # Relu     
+    acc = tl.where(acc > 0.0, acc, 0.0)
+
 
     if HAS_Z:
         out_x_ptr += pid_b * stride_out_batch + pid_c * chunk_size * stride_out_seqlen + pid_h * stride_out_head
