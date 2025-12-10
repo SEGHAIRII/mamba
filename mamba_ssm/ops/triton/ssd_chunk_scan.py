@@ -66,6 +66,7 @@ def _chunk_scan_fwd_kernel(
     BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_DSTATE: tl.constexpr,
     IS_TRITON_22: tl.constexpr,
+    OUTPUT_ACTIVATION: tl.constexpr,
 ):
     pid_bc = tl.program_id(axis=1)
     pid_c = pid_bc // batch
@@ -165,8 +166,8 @@ def _chunk_scan_fwd_kernel(
         
         
    # Relu     
-    acc = tl.where(acc > 0.0, acc, 0.0)
-
+    if OUTPUT_ACTIVATION == "relu":
+        acc = tl.maximum(acc, 0.0)
 
     if HAS_Z:
         out_x_ptr += pid_b * stride_out_batch + pid_c * chunk_size * stride_out_seqlen + pid_h * stride_out_head
@@ -372,6 +373,7 @@ def _chunk_scan_bwd_dz_kernel(
     HAS_DDACS: tl.constexpr,
     RECOMPUTE_OUTPUT: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
+    output_activation: tl.constexpr,
 ):
     pid_bc = tl.program_id(axis=1)
     pid_c = pid_bc // batch
@@ -412,7 +414,8 @@ def _chunk_scan_bwd_dz_kernel(
     z = tl.load(z_ptrs, mask=(offs_m[:, None] < chunk_size_limit) & (offs_n[None, :] < hdim), other=0.0).to(tl.float32)
     z_sigmoid = tl.sigmoid(z)
     # modify it here for relu
-    relu_mask = out > 0.0
+    if output_activation == "relu":
+        relu_mask = out > 0.0
     if RECOMPUTE_OUTPUT:
         outz = out * z * z_sigmoid
         tl.store(outz_ptrs, outz, mask=(offs_m[:, None] < chunk_size_limit) & (offs_n[None, :] < hdim))
@@ -1244,7 +1247,7 @@ def _chunk_scan_bwd_ddAcs_prev_kernel(
     tl.atomic_add(ddA_cumsum_ptrs, ddA_cs, mask=offs_m < chunk_size)
 
 
-def _chunk_scan_fwd(cb, x, dt, dA_cumsum, C, states, D=None, z=None, seq_idx=None):
+def _chunk_scan_fwd(cb, x, dt, dA_cumsum, C, states, D=None, z=None, seq_idx=None, output_activation=None):
     batch, seqlen, nheads, headdim = x.shape
     _, _, nchunks, chunk_size = dt.shape
     _, _, ngroups, dstate = C.shape
@@ -1292,6 +1295,7 @@ def _chunk_scan_fwd(cb, x, dt, dA_cumsum, C, states, D=None, z=None, seq_idx=Non
         HAS_Z=z is not None,
         HAS_SEQ_IDX=seq_idx is not None,
         IS_TRITON_22=TRITON_22,
+        OUTPUT_ACTIVATION=output_activation,
     )
     return out, out_x
 
@@ -1723,7 +1727,7 @@ def _chunk_scan_bwd_ddAcs_prev(prev_states, C, dout, dA_cumsum, seq_idx=None):
 class ChunkScanFn(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, B, C, x, dt, dA_cumsum, prev_states, D=None, z=None):
+    def forward(ctx, B, C, x, dt, dA_cumsum, prev_states, D=None, z=None, output_activation=None):
         # Check constraints.
         batch, seqlen, nheads, headdim = x.shape
         _, _, ngroups, dstate = B.shape
@@ -1749,8 +1753,9 @@ class ChunkScanFn(torch.autograd.Function):
         if D is not None and D.stride(-1) != 1:
             D = D.contiguous()
         CB = _bmm_chunk_fwd(C, B, chunk_size)
-        out, out_x = _chunk_scan_fwd(CB, x, dt, dA_cumsum, C, prev_states, D=D, z=z)
+        out, out_x = _chunk_scan_fwd(CB, x, dt, dA_cumsum, C, prev_states, D=D, z=z, output_activation=output_activation)
         ctx.save_for_backward(out if z is None else out_x, B, C, CB, x, dt, dA_cumsum, prev_states, D, z)
+        ctx.output_activation = output_activation
         return out
 
     @staticmethod
@@ -1766,9 +1771,9 @@ class ChunkScanFn(torch.autograd.Function):
             dz, dout, dD, ddA_cumsum = _chunk_scan_bwd_dz(x, z, out, dout, chunk_size=chunk_size, D=D)
         else:
             dz = None
-            # Added relu here
-            relu_mask = out > 0.0
-            dout = dout * relu_mask
+            if ctx.output_activation == 'relu':
+                relu_mask = out > 0.0
+                dout = dout * relu_mask
         dprev_states = _chunk_scan_bwd_dstates(C, dA_cumsum, dout, dtype=prev_states.dtype)
         dC = _chunk_scan_bwd_dC(prev_states, dA_cumsum, dout, ngroups=ngroups)
         dC = dC.to(C.dtype)
@@ -1787,7 +1792,7 @@ class ChunkScanFn(torch.autograd.Function):
         return dB, dC, dx, ddt, ddA_cumsum, dprev_states, dD, dz
 
 
-def chunk_scan(B, C, x, dt, dA_cumsum, prev_states, D=None, z=None):
+def chunk_scan(B, C, x, dt, dA_cumsum, prev_states, D=None, z=None, output_activation=None):
     """
     prev_states contains the initial_states at index 0, and the state for the next-to-last chunk at index -1.
     Argument:
@@ -1802,7 +1807,7 @@ def chunk_scan(B, C, x, dt, dA_cumsum, prev_states, D=None, z=None):
     Return:
         out: (batch, seqlen, nheads, headdim)
     """
-    return ChunkScanFn.apply(B, C, x, dt, dA_cumsum, prev_states, D, z)
+    return ChunkScanFn.apply(B, C, x, dt, dA_cumsum, prev_states, D, z, output_activation=output_activation)
 
 
 def chunk_scan_ref(B, C, x, dt, dA_cumsum, prev_states, D=None, z=None):

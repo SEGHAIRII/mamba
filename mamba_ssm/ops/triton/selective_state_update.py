@@ -46,6 +46,7 @@ def _selective_scan_update_kernel(
     HAS_Z: tl.constexpr,
     HAS_STATE_BATCH_INDICES: tl.constexpr,
     BLOCK_SIZE_DSTATE: tl.constexpr,
+    output_activation: tl.constexpr = None,
 ):
     pid_m = tl.program_id(axis=0)
     pid_b = tl.program_id(axis=1)
@@ -134,14 +135,15 @@ def _selective_scan_update_kernel(
         out += x * D
         
     # applied relu here
-    out = tl.relu(out)
+    if output_activation == "relu":
+        out = tl.maximum(out, 0.0)
     if HAS_Z:
         out *= z * tl.sigmoid(z)
     tl.store(out_ptrs, out, mask=offs_m < dim)
 
 
 def selective_state_update(state, x, dt, A, B, C, D=None, z=None, dt_bias=None, dt_softplus=False,
-                           state_batch_indices=None):
+                           state_batch_indices=None, output_activation=None):
     """
     Argument:
         state: (batch, dim, dstate) or (batch, nheads, dim, dstate)
@@ -223,6 +225,7 @@ def selective_state_update(state, x, dt, A, B, C, D=None, z=None, dt_bias=None, 
             tie_hdim,
             BLOCK_SIZE_M,
             num_warps=num_warps,
+            output_activation=output_activation
         )
     if not has_heads:
         out = out.squeeze(1)
