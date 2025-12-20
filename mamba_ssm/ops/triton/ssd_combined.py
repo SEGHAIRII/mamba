@@ -61,7 +61,7 @@ def calculate_activation_sparsity(hidden_states: torch.Tensor) -> torch.Tensor:
     sparsity_per_position = (hidden_states == 0).float().mean(dim=-1)
     # Average over batch and sequence: scalar
     sparsity = sparsity_per_position.mean()
-    return sparsity
+    return sparsity * 100
 
 def init_to_zero(names):
     return lambda nargs: [nargs[name].zero_() for name in names if nargs[name] is not None]
