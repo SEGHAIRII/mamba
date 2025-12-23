@@ -571,7 +571,7 @@ class MambaChunkScanCombinedFn(torch.autograd.Function):
             assert cu_seqlens is not None, "cu_seqlens must be provided if return_varlen_states is True"
         out, out_x, dt_out, dA_cumsum, states, final_states, *rest = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=D, z=z, dt_bias=dt_bias, initial_states=initial_states, seq_idx=seq_idx, cu_seqlens=cu_seqlens, dt_softplus=dt_softplus, dt_limit=dt_limit, output_activation=output_activation)
         if return_activation_sparsity:
-            activation_sparsity = calculate_activation_sparsity(out_x)
+            activation_sparsity = calculate_activation_sparsity(rearrange(out_x, "b s h p -> b s (h p)")) 
         ctx.save_for_backward(out if z is None else out_x, x, dt, dA_cumsum, A, B, C, D, z, dt_bias, initial_states, seq_idx)
         ctx.dt_softplus = dt_softplus
         ctx.chunk_size = chunk_size
