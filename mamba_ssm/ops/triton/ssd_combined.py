@@ -1208,7 +1208,9 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
                                                  conv1d_weight, conv1d_bias, seq_idx, None, None, True if activation in ["silu", "swish"] else None),
             "b d s -> b s d"
         )
+        
         x, B, C = torch.split(xBC_conv, [dim, ngroups * dstate, ngroups * dstate], dim=-1)
+        # x, B, C = torch.split(xBC, [dim, ngroups * dstate, ngroups * dstate], dim=-1)
         x = rearrange(x, "b l (h p) -> b l h p", h=nheads)
         B = rearrange(B, "b l (g n) -> b l g n", g=ngroups)
         C = rearrange(C, "b l (g n) -> b l g n", g=ngroups)
@@ -1310,6 +1312,7 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
             "b d s -> b s d"
         )
         x, B, C = torch.split(xBC_conv, [dim, ctx.ngroups * dstate, ctx.ngroups * dstate], dim=-1)
+        # x, B, C = torch.split(xBC, [dim, ctx.ngroups * dstate, ctx.ngroups * dstate], dim=-1)
         x = rearrange(x, "b l (h p) -> b l h p", h=nheads)
         B = rearrange(B, "b l (g n) -> b l g n", g=ctx.ngroups)
         C = rearrange(C, "b l (g n) -> b l g n", g=ctx.ngroups)
@@ -1381,6 +1384,7 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
             dxBC_given.copy_(dxBC_given_update)
         else:
             dxBC_given = dxBC_given_update
+        # dweight, dbias = torch.zeros_like(conv1d_weight), torch.zeros_like(conv1d_bias)
         dxBC_given = rearrange(dxBC_given, "b d s -> b s d")
         return dzxbcdt, dweight, dbias, ddt_bias, dA, dD, None, dinitial_states, None, None, None, None, drmsnorm_weight, None, doutproj_weight, doutproj_bias, None, None, None, None, None, None
 
@@ -1541,16 +1545,16 @@ class MambaSplitConv1dScanCombinedDeltaFn(torch.autograd.Function):
                     out[:, :-1, :]  # Shift by 1 position
                 ], dim=1)
                 
-            diff = out - out_prev
-            diff_norm = torch.abs(diff)
-            is_changed = (diff_norm > threshold)
-            delta = torch.where(is_changed, diff, torch.zeros_like(diff))
+            delta = out - out_prev
+            # diff_norm = torch.abs(diff)
+            # is_changed = (diff_norm > threshold)
+            # delta = torch.where(is_changed, diff, torch.zeros_like(diff))
             if return_activation_sparsity:
                 activation_sparsity = calculate_activation_sparsity(delta)  
             current_out = F.linear(delta, outproj_weight, outproj_bias)
             out = torch.cumsum(current_out, dim=1)  
             # out = F.linear(out, outproj_weight, outproj_bias)
-            regularization_term = (diff**2).sum(dim=-1).mean()
+            regularization_term = (delta**2).sum(dim=-1).mean()
             # Also calculate L2 norm
         else:
             assert outproj_bias is None
@@ -1637,13 +1641,19 @@ class MambaSplitConv1dScanCombinedDeltaFn(torch.autograd.Function):
                     out_for_delta = out_for_delta_01
             
             # Recompute delta from the correct pre-projection tensor
+            # out_prev = torch.cat([
+            #     torch.zeros_like(out_for_delta[:, :1, :]),
+            #     out_for_delta[:, :-1, :]
+            # ], dim=1)
+            # diff = out_for_delta - out_prev
+            # is_changed = (torch.abs(diff) > ctx.threshold).float()
+            # delta = diff * is_changed
+            
             out_prev = torch.cat([
                 torch.zeros_like(out_for_delta[:, :1, :]),
                 out_for_delta[:, :-1, :]
             ], dim=1)
-            diff = out_for_delta - out_prev
-            is_changed = (torch.abs(diff) > ctx.threshold).float()
-            delta = diff * is_changed
+            delta = out_for_delta - out_prev
             
             # Backprop through cumsum: gradient of cumsum is reverse cumsum
             dcurrent_out = torch.flip(torch.cumsum(torch.flip(dout_og, dims=[1]), dim=1), dims=[1])
@@ -1652,11 +1662,11 @@ class MambaSplitConv1dScanCombinedDeltaFn(torch.autograd.Function):
             ddelta = F.linear(dcurrent_out, outproj_weight.t())
             
             # Backprop through masking
-            ddiff = ddelta * is_changed
+            # ddiff = ddelta * is_changed
             
             # Backprop through diff = out - out_prev
-            dout = ddiff.clone()
-            dout_prev = -ddiff
+            dout = ddelta.clone()
+            dout_prev = -ddelta
             dout[:, :-1, :] += dout_prev[:, 1:, :]
         
         # Standard backward pass setup
@@ -1741,429 +1751,6 @@ class MambaSplitConv1dScanCombinedDeltaFn(torch.autograd.Function):
         dxBC_given = rearrange(dxBC_given, "b d s -> b s d")
         
         return dzxbcdt, dweight, dbias, ddt_bias, dA, dD, None, dinitial_states, None, None, None, None, drmsnorm_weight, None, doutproj_weight, doutproj_bias, None, None, None, None, None, None
-
-
-# @triton.jit
-# def _delta_carry_kernel(
-#     x_ptr, delta_ptr, mask_ptr, last_changed_ptr,
-#     batch_stride_x, seq_stride_x, dim_stride_x,
-#     batch_stride_d, seq_stride_d, dim_stride_d,
-#     seqlen, dim,
-#     threshold,
-#     BLOCK_SIZE: tl.constexpr,
-# ):
-#     """
-#     One program per (batch, dim). BLOCK_SIZE=16 keeps the static_range unroll
-#     compact (low register pressure, high occupancy). The outer tile loop is a
-#     normal Triton range loop — not unrolled — so seqlen can be arbitrary.
-#     """
-#     batch_idx = tl.program_id(0)
-#     dim_idx   = tl.program_id(1)
-
-#     x_base = x_ptr     + batch_idx * batch_stride_x + dim_idx * dim_stride_x
-#     d_base = delta_ptr + batch_idx * batch_stride_d + dim_idx * dim_stride_d
-#     m_base = mask_ptr  + batch_idx * batch_stride_d + dim_idx * dim_stride_d
-
-#     last_changed = tl.zeros((), dtype=tl.float32)
-#     n_tiles = tl.cdiv(seqlen, BLOCK_SIZE)
-
-#     for tile_idx in range(n_tiles):
-#         tile_start = tile_idx * BLOCK_SIZE
-#         offsets    = tile_start + tl.arange(0, BLOCK_SIZE)
-#         valid      = offsets < seqlen
-
-#         deltas_arr = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
-#         masks_arr  = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
-
-#         for i in tl.static_range(BLOCK_SIZE):
-#             t       = tile_start + i
-#             in_mask = t < seqlen
-#             curr    = tl.load(x_base + t * seq_stride_x,
-#                               mask=in_mask, other=last_changed).to(tl.float32)
-#             diff    = curr - last_changed
-#             changed = (tl.abs(diff) > threshold) & in_mask
-
-#             deltas_arr = tl.where(tl.arange(0, BLOCK_SIZE) == i,
-#                                   tl.where(changed, diff, 0.0), deltas_arr)
-#             masks_arr  = tl.where(tl.arange(0, BLOCK_SIZE) == i,
-#                                   tl.where(changed, 1.0,  0.0), masks_arr)
-#             last_changed = tl.where(changed, curr, last_changed)
-
-#         tl.store(d_base + offsets * seq_stride_d, deltas_arr, mask=valid)
-#         tl.store(m_base + offsets * seq_stride_d, masks_arr,  mask=valid)
-
-#     tl.store(last_changed_ptr + batch_idx * dim + dim_idx, last_changed)
-
-
-# def _delta_encode_fwd(x: torch.Tensor, threshold: float, block_size: int = 16):
-#     assert x.is_cuda and x.is_contiguous()
-#     batch, seqlen, dim = x.shape
-
-#     delta        = torch.empty_like(x)
-#     mask         = torch.empty_like(x)
-#     last_changed = torch.empty(batch, dim, device=x.device, dtype=torch.float32)
-
-#     bs_x, ss_x, ds_x = x.stride()
-#     bs_d, ss_d, ds_d = delta.stride()
-
-#     _delta_carry_kernel[(batch, dim)](
-#         x, delta, mask, last_changed,
-#         bs_x, ss_x, ds_x,
-#         bs_d, ss_d, ds_d,
-#         seqlen, dim, threshold,
-#         BLOCK_SIZE=block_size,
-#     )
-
-#     return delta, mask, last_changed
-
-
-# def _delta_encode_bwd_kernel(
-#     grad_delta_ptr, mask_ptr, grad_x_ptr,
-#     batch_stride, seq_stride, dim_stride,
-#     seqlen,
-#     BLOCK_SIZE: tl.constexpr,
-# ):
-#     batch_idx = tl.program_id(0)
-#     tile_idx  = tl.program_id(1)
-#     dim_idx   = tl.program_id(2)
-
-#     tile_start = tile_idx * BLOCK_SIZE
-#     offsets    = tile_start + tl.arange(0, BLOCK_SIZE)
-#     load_mask  = offsets < seqlen
-
-#     base      = batch_idx * batch_stride + dim_idx * dim_stride
-#     grad      = tl.load(grad_delta_ptr + base + offsets * seq_stride, mask=load_mask, other=0.0).to(tl.float32)
-#     mask_vals = tl.load(mask_ptr       + base + offsets * seq_stride, mask=load_mask, other=0.0).to(tl.float32)
-
-#     tl.store(grad_x_ptr + base + offsets * seq_stride, grad * mask_vals, mask=load_mask)
-
-
-# def _delta_encode_bwd(grad_delta: torch.Tensor, mask: torch.Tensor, block_size: int = 256):
-#     grad_x  = torch.empty_like(grad_delta)
-#     batch, seqlen, dim = grad_delta.shape
-#     BLOCK_SIZE = block_size
-#     n_tiles    = triton.cdiv(seqlen, BLOCK_SIZE)
-#     bs, ss, ds = grad_delta.stride()
-
-#     _delta_encode_bwd_kernel[(batch, n_tiles, dim)](
-#         grad_delta, mask, grad_x,
-#         bs, ss, ds,
-#         seqlen,
-#         BLOCK_SIZE=BLOCK_SIZE,
-#     )
-#     return grad_x
-
-
-# class DeltaEncodeTriton(torch.autograd.Function):
-#     @staticmethod
-#     def forward(ctx, out, threshold):
-#         # Ensure float32 contiguous before passing to kernels
-#         x = out.float().contiguous()
-#         delta, mask, _ = _delta_encode_fwd(x, threshold)
-
-#         ctx.save_for_backward(mask)
-#         ctx.threshold = threshold
-#         # Return in same dtype as input to stay compatible with downstream code
-#         return delta.to(out.dtype), mask.to(out.dtype)
-
-#     @staticmethod
-#     def backward(ctx, ddelta, dmask):
-#         (mask,) = ctx.saved_tensors
-#         grad_x = _delta_encode_bwd(
-#             ddelta.float().contiguous(),
-#             mask.float().contiguous(),
-#         )
-#         return grad_x.to(ddelta.dtype), None
-
-
-# def delta_encode_triton(out, threshold):
-#     return DeltaEncodeTriton.apply(out, threshold)
-
-
-# def _linear_cumsum(delta, weight):
-#     """cumsum(delta @ W.T, dim=1) — no bias, intentional."""
-#     return torch.cumsum(F.linear(delta, weight), dim=1)
-
-
-# def _linear_cumsum_bwd_input(dcurrent_out, weight):
-#     """
-#     Grad w.r.t. delta: F.linear(dcurrent_out, weight.t())
-#     Single matmul — no chunking needed (transient alloc, not saved).
-#     """
-#     return F.linear(dcurrent_out, weight.t())
-
-
-# # =============================================================================
-# # CORRECTED MAMBA DELTA FUNCTION (ready to paste)
-# # =============================================================================
-# class MambaSplitConv1dScanCombinedDeltaFn(torch.autograd.Function):
-#     @staticmethod
-#     @custom_fwd
-#     def forward(ctx, zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size,
-#                 initial_states=None, seq_idx=None, dt_limit=(0.0, float("inf")),
-#                 return_final_states=False, activation="silu",
-#                 rmsnorm_weight=None, rmsnorm_eps=1e-6, outproj_weight=None, outproj_bias=None,
-#                 headdim=None, ngroups=1, norm_before_gate=True,
-#                 return_activation_sparsity=False, output_activation=None, threshold=0.1):
-
-#         if D.dim() == 1:
-#             assert headdim is not None
-#             nheads = D.shape[0]
-#         else:
-#             nheads, headdim = D.shape
-#         batch, seqlen, _ = zxbcdt.shape
-#         dim = nheads * headdim
-
-#         assert nheads % ngroups == 0
-#         dstate = (conv1d_weight.shape[0] - dim) // ngroups // 2
-#         d_nonssm = (zxbcdt.shape[-1] - 2 * dim - 2 * ngroups * dstate - nheads) // 2
-
-#         zx0, z, xBC, dt = torch.split(zxbcdt, [2 * d_nonssm, dim, dim + ngroups * dstate * 2, nheads], dim=-1)
-#         seq_idx = seq_idx.contiguous() if seq_idx is not None else None
-
-#         xBC_conv = rearrange(
-#             causal_conv1d_fwd_function(rearrange_and_update_stride(xBC, "b s d -> b d s"),
-#                                        conv1d_weight, conv1d_bias, seq_idx, None, None,
-#                                        True if activation in ["silu", "swish"] else None),
-#             "b d s -> b s d"
-#         )
-#         x, B, C = torch.split(xBC_conv, [dim, ngroups * dstate, ngroups * dstate], dim=-1)
-#         x = rearrange(x, "b l (h p) -> b l h p", h=nheads)
-#         B = rearrange(B, "b l (g n) -> b l g n", g=ngroups)
-#         C = rearrange(C, "b l (g n) -> b l g n", g=ngroups)
-#         z = rearrange(z, "b l (h p) -> b l h p", h=nheads) if z is not None else None
-
-#         # Mamba core
-#         if rmsnorm_weight is None:
-#             out, out_x, dt_out, dA_cumsum, states, final_states = _mamba_chunk_scan_combined_fwd(
-#                 x, dt, A, B, C, chunk_size=chunk_size, D=D, z=z, dt_bias=dt_bias,
-#                 initial_states=initial_states, seq_idx=seq_idx, dt_softplus=True,
-#                 dt_limit=dt_limit, output_activation=output_activation
-#             )
-#             if return_activation_sparsity:
-#                 activation_sparsity = calculate_activation_sparsity(rearrange(out_x, "b s h p -> b s (h p)"))
-#             out = rearrange(out, "b s h p -> b s (h p)")
-#             rstd = None
-#             if d_nonssm > 0:
-#                 if activation in ["silu", "swish"]:
-#                     out = torch.cat([_swiglu_fwd(zx0), out], dim=-1)
-#                 else:
-#                     out = torch.cat([_reglu_fwd(zx0), out], dim=-1)
-#             out_before_proj = out
-#         else:
-#             # RMSNorm branch
-#             out_x, _, dt_out, dA_cumsum, states, final_states = _mamba_chunk_scan_combined_fwd(
-#                 x, dt, A, B, C, chunk_size=chunk_size, D=D, z=None, dt_bias=dt_bias,
-#                 initial_states=initial_states, seq_idx=seq_idx, dt_softplus=True,
-#                 dt_limit=dt_limit, output_activation=output_activation
-#             )
-#             x_rms = rearrange(out_x, "b s h p -> (b s) (h p)")
-#             z_rms = rearrange(z, "b s h p -> (b s) (h p)")
-#             rmsnorm_weight = rmsnorm_weight.contiguous()
-
-#             if d_nonssm > 0:
-#                 out01 = torch.empty((batch, seqlen, d_nonssm + dim), dtype=x_rms.dtype, device=x_rms.device)
-#                 out_for_ln = rearrange(out01[..., d_nonssm:], "b s d -> (b s) d")
-#                 if activation in ["silu", "swish"]:
-#                     out01[..., :d_nonssm] = _swiglu_fwd(zx0, out=out01[..., :d_nonssm])
-#                 elif activation == "relu":
-#                     out01[..., :d_nonssm] = _reglu_fwd(zx0, out=out01[..., :d_nonssm])
-#             else:
-#                 out01 = None
-#                 out_for_ln = None
-
-#             out_ln, _, rstd = _layer_norm_fwd(x_rms, rmsnorm_weight, None, rmsnorm_eps, z_rms,
-#                                               out=out_for_ln, group_size=dim // ngroups,
-#                                               norm_before_gate=norm_before_gate, is_rms_norm=True)
-
-#             if d_nonssm == 0:
-#                 out = rearrange(out_ln, "(b s) d -> b s d", b=batch)
-#             else:
-#                 out = out01
-#             out_before_proj = out[..., d_nonssm:] if d_nonssm > 0 else out
-
-#         # DELTA ENCODING (only on SSM hidden state)
-#         ctx.outproj_weight_dtype = outproj_weight.dtype if outproj_weight is not None else None
-#         regularization_term = torch.tensor(0.0, device=out.device, dtype=torch.float32)
-
-#         if outproj_weight is not None:
-#             if torch.is_autocast_enabled():
-#                 dtype = torch.get_autocast_gpu_dtype()
-#                 out_before_proj = out_before_proj.to(dtype)
-#                 outproj_weight = outproj_weight.to(dtype)
-
-#             delta, mask = delta_encode_triton(out_before_proj, threshold)
-
-#             if return_activation_sparsity:
-#                 activation_sparsity = (mask == 0).float().mean()
-
-#             # Chunked linear+cumsum — avoids allocating (B, seqlen, dim_out) at once
-#             out_projected = _linear_cumsum(delta, outproj_weight)
-
-#             if d_nonssm > 0:
-#                 out = torch.cat([out[..., :d_nonssm], out_projected], dim=-1)
-#             else:
-#                 out = out_projected
-
-#             regularization_term = (delta ** 2).sum(dim=-1).mean()
-
-#             ctx.save_for_backward(
-#                 zxbcdt, conv1d_weight, conv1d_bias, out_x, A, D, dt_bias,
-#                 initial_states, seq_idx, rmsnorm_weight, rstd,
-#                 outproj_weight, outproj_bias, delta, mask, out_before_proj,
-#             )
-#             ctx.has_outproj = True
-#         else:
-#             ctx.save_for_backward(
-#                 zxbcdt, conv1d_weight, conv1d_bias, out_x, A, D, dt_bias,
-#                 initial_states, seq_idx, rmsnorm_weight, rstd,
-#                 None, None, None, None, None,
-#             )
-#             ctx.has_outproj = False
-
-#         ctx.dt_limit = dt_limit
-#         ctx.return_final_states = return_final_states
-#         ctx.activation = activation
-#         ctx.rmsnorm_eps = rmsnorm_eps
-#         ctx.norm_before_gate = norm_before_gate
-#         ctx.chunk_size = chunk_size
-#         ctx.headdim = headdim
-#         ctx.ngroups = ngroups
-#         ctx.output_activation = output_activation
-#         ctx.threshold = threshold
-#         ctx.d_nonssm = d_nonssm
-#         ctx.dim = dim
-#         ctx.dstate = dstate
-
-#         if not (return_final_states or return_activation_sparsity):
-#             return out, regularization_term
-
-#         out_tuple = (out,)
-#         if return_final_states:
-#             out_tuple = out_tuple + (final_states,)
-#         if return_activation_sparsity:
-#             out_tuple = out_tuple + (activation_sparsity,)
-#         return out_tuple + (regularization_term,)
-
-#     @staticmethod
-#     @custom_bwd
-#     def backward(ctx, dout, *args):
-#         zxbcdt, conv1d_weight, conv1d_bias, out_x, A, D, dt_bias = ctx.saved_tensors[:7]
-#         initial_states, seq_idx, rmsnorm_weight, rstd = ctx.saved_tensors[7:11]
-#         outproj_weight, outproj_bias = ctx.saved_tensors[11:13]
-#         delta, mask, out_before_proj = ctx.saved_tensors[13:16]
-
-#         dfinal_states = args[0] if ctx.return_final_states else None
-
-#         nheads = D.shape[0] if D.dim() == 1 else D.shape[0]
-#         dim = ctx.dim
-#         d_nonssm = ctx.d_nonssm
-#         dstate = ctx.dstate
-
-#         zx0, z, xBC, dt = torch.split(zxbcdt, [2 * d_nonssm, dim, dim + 2 * ctx.ngroups * dstate, nheads], dim=-1)
-#         z = rearrange(z, "b l (h p) -> b l h p", h=nheads)
-
-#         if ctx.has_outproj and outproj_weight is not None:
-#             if d_nonssm > 0:
-#                 dout_nonssm, dout_ssm = dout.split([d_nonssm, dim], dim=-1)
-#             else:
-#                 dout_nonssm = None
-#                 dout_ssm = dout
-
-#             # Reverse cumsum of upstream grad (suffix-sum = grad through cumsum)
-#             dcurrent_out = torch.flip(
-#                 torch.cumsum(torch.flip(dout_ssm, dims=[1]), dim=1), dims=[1]
-#             )
-
-#             # Chunked matmul backward for input grad (avoids B×T×dim_in alloc at once)
-#             ddelta = _linear_cumsum_bwd_input(dcurrent_out, outproj_weight)
-#             dout_before_proj_ssm = ddelta * mask
-
-#             # Weight grad output is (dim_out, dim_in) — small, no OOM risk
-#             doutproj_weight = torch.einsum("bso,bsd->od", dcurrent_out, delta)
-#             doutproj_bias = dcurrent_out.sum(dim=(0, 1)) if outproj_bias is not None else None
-
-#             dout_before_proj = dout_before_proj_ssm
-#         else:
-#             doutproj_weight = doutproj_bias = None
-#             if d_nonssm > 0:
-#                 dout_nonssm, dout_before_proj = dout.split([d_nonssm, dim], dim=-1)
-#             else:
-#                 dout_before_proj = dout
-
-#         if d_nonssm > 0:
-#             if ctx.activation in ["silu", "swish"]:
-#                 _swiglu_bwd(zx0, dout_nonssm, dxy=None, recompute_output=False)
-#             else:
-#                 _reglu_bwd(zx0, dout_nonssm, dxy=None, recompute_output=False)
-
-#         xBC_conv = rearrange(
-#             causal_conv1d_fwd_function(rearrange_and_update_stride(xBC, "b s d -> b d s"),
-#                                        conv1d_weight, conv1d_bias, seq_idx, None, None,
-#                                        True if ctx.activation in ["silu", "swish"] else False),
-#             "b d s -> b s d"
-#         )
-#         x, B, C = torch.split(xBC_conv, [dim, ctx.ngroups * dstate, ctx.ngroups * dstate], dim=-1)
-#         x = rearrange(x, "b l (h p) -> b l h p", h=nheads)
-#         B = rearrange(B, "b l (g n) -> b l g n", g=ctx.ngroups)
-#         C = rearrange(C, "b l (g n) -> b l g n", g=ctx.ngroups)
-
-#         dzxbcdt = torch.empty_like(zxbcdt)
-#         dzx0, dz, dxBC_given, ddt_given = torch.split(dzxbcdt, [2 * d_nonssm, dim, dim + 2 * ctx.ngroups * dstate, nheads], dim=-1)
-
-#         dxBC = torch.empty_like(xBC)
-#         dx, dB, dC = torch.split(dxBC, [dim, ctx.ngroups * dstate, ctx.ngroups * dstate], dim=-1)
-#         dx = rearrange(dx, "b l (h p) -> b l h p", h=nheads)
-#         dB = rearrange(dB, "b l (g n) -> b l g n", g=ctx.ngroups)
-#         dC = rearrange(dC, "b l (g n) -> b l g n", g=ctx.ngroups)
-
-#         if rmsnorm_weight is None:
-#             dout_before_proj = rearrange(dout_before_proj, "b s (h p) -> b s h p", p=ctx.headdim)
-#             dz = rearrange(dz, "b l (h p) -> b l h p", h=nheads)
-#             dx, ddt, dA, dB, dC, dD, dz, ddt_bias, dinitial_states, *_ = _mamba_chunk_scan_combined_bwd(
-#                 dout_before_proj, x, dt, A, B, C, out_x, ctx.chunk_size, D=D, z=z,
-#                 dt_bias=dt_bias, initial_states=initial_states, dfinal_states=dfinal_states,
-#                 seq_idx=seq_idx, dt_softplus=True, dt_limit=ctx.dt_limit,
-#                 dx=dx, ddt=ddt_given, dB=dB, dC=dC, dz=dz, recompute_output=False,
-#                 output_activation=ctx.output_activation
-#             )
-#             drmsnorm_weight = None
-#         else:
-#             batch = dout_before_proj.shape[0]
-#             dy_rms = rearrange(dout_before_proj, "b s (h p) -> (b s) (h p)", p=ctx.headdim)
-#             dz = rearrange(dz, "b l d -> (b l) d")
-#             x_rms = rearrange(out_x, "b s h p -> (b s) (h p)")
-#             z_rms = rearrange(z, "b s h p -> (b s) (h p)")
-
-#             dout_rms, drmsnorm_weight, _, dz, *_ = _layer_norm_bwd(
-#                 dy_rms, x_rms, rmsnorm_weight, None, ctx.rmsnorm_eps, None, rstd, z_rms,
-#                 group_size=dim // ctx.ngroups, norm_before_gate=ctx.norm_before_gate,
-#                 is_rms_norm=True, recompute_output=False, dz=dz
-#             )
-#             dout_rms = rearrange(dout_rms, "(b s) (h p) -> b s h p", b=batch, p=ctx.headdim)
-
-#             dx, ddt, dA, dB, dC, dD, _, ddt_bias, dinitial_states = _mamba_chunk_scan_combined_bwd(
-#                 dout_rms, x, dt, A, B, C, out_x, ctx.chunk_size, D=D, z=None,
-#                 dt_bias=dt_bias, initial_states=initial_states, dfinal_states=dfinal_states,
-#                 seq_idx=seq_idx, dt_softplus=True, dt_limit=ctx.dt_limit,
-#                 dx=dx, ddt=ddt_given, dB=dB, dC=dC, output_activation=ctx.output_activation
-#             )
-
-#         dxBC_given = rearrange(dxBC_given, "b s d -> b d s")
-#         dxBC_given_update, dweight, dbias, *_ = causal_conv1d_bwd_function(
-#             rearrange_and_update_stride(xBC, "b s d -> b d s"), conv1d_weight, conv1d_bias,
-#             rearrange(dxBC, "b s d -> b d s"), seq_idx, None, None,
-#             rearrange_and_update_stride(dxBC_given), False,
-#             True if ctx.activation in ["silu", "swish"] else False
-#         )
-#         if dxBC_given.stride() != dxBC_given_update.stride():
-#             dxBC_given.copy_(dxBC_given_update)
-#         else:
-#             dxBC_given = dxBC_given_update
-#         dxBC_given = rearrange(dxBC_given, "b d s -> b s d")
-
-#         return (dzxbcdt, dweight, dbias, ddt_bias, dA, dD, None, dinitial_states, None, None, None, None,
-#                 drmsnorm_weight, None, doutproj_weight, doutproj_bias, None, None, None, None, None, None)
 
 
 def mamba_split_conv1d_scan_combined_Delta(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states=None, seq_idx=None, dt_limit=(0.0, float("inf")), return_final_states=False, activation="silu", rmsnorm_weight=None, rmsnorm_eps=1e-6, outproj_weight=None, outproj_bias=None, headdim=None, ngroups=1, norm_before_gate=True, return_activation_sparsity = False, output_activation = None, threshold = None):
@@ -3279,3 +2866,243 @@ def sfa_mamba_split_conv1d_scan_combined(zxbcdt, conv1d_weight, conv1d_bias, dt_
         out: (batch, seqlen, dim)
     """
     return SfaMambaSplitConv1dScanCombinedFn.apply(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states, seq_idx, dt_limit, return_final_states, activation, rmsnorm_weight, rmsnorm_eps, outproj_weight, outproj_bias, headdim, ngroups, norm_before_gate, return_activation_sparsity, output_activation, threshold)
+
+
+# ================================== no conv =============================
+class MambaSplitScanCombinedFn(torch.autograd.Function):
+
+    @staticmethod
+    @custom_fwd
+    def forward(ctx, zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states=None, seq_idx=None, dt_limit=(0.0, float("inf")), return_final_states=False, activation="silu",
+                rmsnorm_weight=None, rmsnorm_eps=1e-6, outproj_weight=None, outproj_bias=None, headdim=None,
+                ngroups=1, norm_before_gate=True, return_activation_sparsity = False, output_activation = None, threshold=0.0):
+        # assert activation in [None, "silu", "swish", "relu"]
+        if D.dim() == 1:
+            assert headdim is not None
+            nheads, = D.shape
+        else:
+            nheads, headdim = D.shape
+        batch, seqlen, _ = zxbcdt.shape
+        dim = nheads * headdim
+        assert nheads % ngroups == 0
+        dstate = (conv1d_weight.shape[0] - dim) // ngroups // 2
+        d_nonssm = (zxbcdt.shape[-1] - 2 * dim - 2 * ngroups * dstate - nheads) // 2
+        assert d_nonssm >= 0
+        assert zxbcdt.shape == (batch, seqlen, 2 * d_nonssm + 2 * dim + 2 * ngroups * dstate + nheads)
+        assert dt_bias.shape == (nheads,)
+        assert A.shape == (nheads,)
+        zx0, z, xBC, dt = torch.split(zxbcdt, [2 * d_nonssm, dim, dim + ngroups * dstate * 2, nheads], dim=-1)
+        seq_idx = seq_idx.contiguous() if seq_idx is not None else None
+        # xBC_conv = rearrange(
+            # causal_conv1d_fwd_function(rearrange_and_update_stride(xBC, "b s d -> b d s"),
+                                                #  conv1d_weight, conv1d_bias, seq_idx, None, None, True if activation in ["silu", "swish"] else None),
+            # "b d s -> b s d"
+        # )
+        
+        # x, B, C = torch.split(xBC_conv, [dim, ngroups * dstate, ngroups * dstate], dim=-1)
+        xBC = F.silu(xBC) if activation in ["silu", "swish"] else xBC
+        x, B, C = torch.split(xBC, [dim, ngroups * dstate, ngroups * dstate], dim=-1)
+        
+        x = rearrange(x, "b l (h p) -> b l h p", h=nheads)
+        B = rearrange(B, "b l (g n) -> b l g n", g=ngroups)
+        C = rearrange(C, "b l (g n) -> b l g n", g=ngroups)
+        
+        # C centered
+        # C = C - C.mean(dim=-1, keepdim=True)
+        z = rearrange(z, "b l (h p) -> b l h p", h=nheads) if z is not None else None
+        if rmsnorm_weight is None:
+            out, out_x, dt_out, dA_cumsum, states, final_states = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size=chunk_size, D=D, z=z, dt_bias=dt_bias, initial_states=initial_states, seq_idx=seq_idx, dt_softplus=True, dt_limit=dt_limit, output_activation=output_activation, threshold=threshold)
+            if return_activation_sparsity:
+                activation_sparsity = calculate_activation_sparsity(rearrange(out_x, "b s h p -> b s (h p)"))  
+            out = rearrange(out, "b s h p -> b s (h p)")
+            rstd = None
+            if d_nonssm > 0:
+                if activation in ["silu", "swish"]:
+                    out = torch.cat([_swiglu_fwd(zx0), out], dim=-1)
+                else:
+                    out = torch.cat([_reglu_fwd(zx0), out], dim=-1)
+        else:
+            out_x, _, dt_out, dA_cumsum, states, final_states = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size=chunk_size, D=D, z=None, dt_bias=dt_bias, initial_states=initial_states, seq_idx=seq_idx, dt_softplus=True, dt_limit=dt_limit, output_activation=output_activation, threshold=threshold)
+            # reshape input data into 2D tensor
+            if return_activation_sparsity:
+                activation_sparsity = calculate_activation_sparsity(rearrange(out_x, "b s h p -> b s (h p)"))  
+            # rearranged_x = rearrange(out_x, "b s h p -> b s (h p)")
+            # total_0 = (rearranged_x[-1] == 0).float().mean(-1).mean()
+            # print(total_0)
+            x_rms = rearrange(out_x, "b s h p -> (b s) (h p)")
+            z_rms = rearrange(z, "b s h p -> (b s) (h p)")
+            rmsnorm_weight = rmsnorm_weight.contiguous()
+            if d_nonssm == 0:
+                out = None
+            else:
+                out01 = torch.empty((batch, seqlen, d_nonssm + dim), dtype=x_rms.dtype, device=x_rms.device)
+                out = rearrange(out01[..., d_nonssm:], "b s d -> (b s) d")
+                if activation == "silu" or activation == "swish":
+                    out01[..., :d_nonssm] = _swiglu_fwd(zx0, out=out01[..., :d_nonssm])
+                elif activation == "relu":
+                    out01[..., :d_nonssm] = _reglu_fwd(zx0, out=out01[..., :d_nonssm])
+                    
+            out, _, rstd = _layer_norm_fwd(x_rms, rmsnorm_weight, None, rmsnorm_eps, z_rms, out=out,
+                                           group_size=dim // ngroups,
+                                           norm_before_gate=norm_before_gate, is_rms_norm=True)
+            if d_nonssm == 0:
+                out = rearrange(out, "(b s) d -> b s d", b=batch)
+            else:
+                out = out01
+        ctx.outproj_weight_dtype = outproj_weight.dtype if outproj_weight is not None else None
+        if outproj_weight is not None:
+            if torch.is_autocast_enabled():
+                dtype = torch.get_autocast_gpu_dtype()
+                out, outproj_weight = out.to(dtype), outproj_weight.to(dtype)
+                outproj_bias = outproj_bias.to(dtype) if outproj_bias is not None else None
+            out = F.linear(out, outproj_weight, outproj_bias)
+        else:
+            assert outproj_bias is None
+        ctx.save_for_backward(zxbcdt, conv1d_weight, conv1d_bias,
+                              out_x, A, D, dt_bias, initial_states, seq_idx, rmsnorm_weight, rstd, outproj_weight, outproj_bias)
+        ctx.dt_limit = dt_limit
+        ctx.return_final_states = return_final_states
+        ctx.activation = activation
+        ctx.rmsnorm_eps = rmsnorm_eps
+        ctx.norm_before_gate = norm_before_gate
+        ctx.chunk_size = chunk_size
+        ctx.headdim = headdim
+        ctx.ngroups = ngroups
+        ctx.output_activation = output_activation
+        ctx.threshold = threshold
+        # return out if not return_final_states else (out, final_states) if not return_activation_sparsity else (out, final_states, activation_sparsity)
+        if not (return_final_states or return_activation_sparsity):
+            return out
+        out = (out, )
+        if return_final_states:
+            out = out + (final_states, )
+        if return_activation_sparsity:
+            out = out + (activation_sparsity, )
+        return out
+
+    @staticmethod
+    @custom_bwd
+    def backward(ctx, dout, *args):
+        zxbcdt, conv1d_weight, conv1d_bias, out, A, D, dt_bias, initial_states, seq_idx, rmsnorm_weight, rstd, outproj_weight, outproj_bias = ctx.saved_tensors
+        dfinal_states = args[0] if ctx.return_final_states else None
+        headdim = ctx.headdim
+        nheads = D.shape[0]
+        dim = nheads * headdim
+        assert nheads % ctx.ngroups == 0
+        dstate = (conv1d_weight.shape[0] - dim) // ctx.ngroups // 2
+        d_nonssm = (zxbcdt.shape[-1] - 2 * dim - 2 * ctx.ngroups * dstate - nheads) // 2
+        assert d_nonssm >= 0
+        recompute_output = outproj_weight is not None
+        if recompute_output:
+            out_recompute = torch.empty(*out.shape[:2], d_nonssm + dim, device=out.device, dtype=out.dtype)
+            out0_recompute, out1_recompute = out_recompute.split([d_nonssm, dim], dim=-1)
+        zx0, z, xBC, dt = torch.split(zxbcdt, [2 * d_nonssm, dim, dim + 2 * ctx.ngroups * dstate, nheads], dim=-1)
+        # Recompute x, B, C
+        # xBC_conv = rearrange(
+            # causal_conv1d_fwd_function(rearrange_and_update_stride(xBC, "b s d -> b d s"),
+                                    #    conv1d_weight, conv1d_bias, seq_idx, None, None, True if ctx.activation in ["silu", "swish"] else False),
+            # "b d s -> b s d"
+        # )
+        # x, B, C = torch.split(xBC_conv, [dim, ctx.ngroups * dstate, ctx.ngroups * dstate], dim=-1)
+        xBC_old = xBC.copy()
+        xBC = F.silu(xBC) if ctx.activation in ["silu", "swish"] else xBC
+        x, B, C = torch.split(xBC, [dim, ctx.ngroups * dstate, ctx.ngroups * dstate], dim=-1)
+        x = rearrange(x, "b l (h p) -> b l h p", h=nheads)
+        B = rearrange(B, "b l (g n) -> b l g n", g=ctx.ngroups)
+        C = rearrange(C, "b l (g n) -> b l g n", g=ctx.ngroups)
+        
+        # Center C to match the centered C from forward pass
+        # C = C - C.mean(dim=-1, keepdim=True)
+        
+        dzxbcdt = torch.empty_like(zxbcdt)
+        dzx0, dz, dxBC_given, ddt_given = torch.split(dzxbcdt, [2 * d_nonssm, dim, dim + 2 * ctx.ngroups * dstate, nheads], dim=-1)
+        dxBC = torch.empty_like(xBC)
+        dx, dB, dC = torch.split(dxBC, [dim, ctx.ngroups * dstate, ctx.ngroups * dstate], dim=-1)
+        z = rearrange(z, "b l (h p) -> b l h p", h=nheads)
+        dx = rearrange(dx, "b l (h p) -> b l h p", h=nheads)
+        dB = rearrange(dB, "b l (g n) -> b l g n", g=ctx.ngroups)
+        dC = rearrange(dC, "b l (g n) -> b l g n", g=ctx.ngroups)
+        if outproj_weight is not None:
+            dout_og = dout
+            dout = F.linear(dout, outproj_weight.t())
+        if d_nonssm > 0:
+            dout0, dout = dout.split([d_nonssm, dim], dim=-1)
+            if ctx.activation in ["silu", "swish"]:
+                _swiglu_bwd(zx0, dout0, dxy=dzx0, recompute_output=True, out=out0_recompute)
+            elif ctx.activation == "relu":
+                _reglu_bwd(zx0, dout0, dxy=dzx0, recompute_output=True, out=out0_recompute)
+        
+        dout = rearrange(dout, "b s (h p) -> b s h p", p=headdim)
+        if rmsnorm_weight is None:
+            dz = rearrange(dz, "b l (h p) -> b l h p", h=nheads)
+            dx, ddt, dA, dB, dC, dD, dz, ddt_bias, dinitial_states, *rest = _mamba_chunk_scan_combined_bwd(
+                dout, x, dt, A, B, C, out, ctx.chunk_size, D=D, z=z, dt_bias=dt_bias, initial_states=initial_states, dfinal_states=dfinal_states, seq_idx=seq_idx, dt_softplus=True, dt_limit=ctx.dt_limit, dx=dx, ddt=ddt_given, dB=dB, dC=dC, dz=dz, recompute_output=recompute_output, output_activation=ctx.output_activation, threshold=ctx.threshold
+            )
+            out_for_linear = rearrange(rest[0], "b s h p -> b s (h p)") if recompute_output else None
+            drmsnorm_weight = None
+        else:
+            batch = dout.shape[0]
+            dy_rms = rearrange(dout, "b s h p -> (b s) (h p)")
+            dz = rearrange(dz, "b l d -> (b l) d")
+            x_rms = rearrange(out, "b s h p -> (b s) (h p)")
+            z_rms = rearrange(z, "b s h p -> (b s) (h p)")
+            out1_recompute = rearrange(out1_recompute, "b s d -> (b s) d") if recompute_output else None
+            dout, drmsnorm_weight, _, dz, *rest = _layer_norm_bwd(dy_rms, x_rms, rmsnorm_weight, None, ctx.rmsnorm_eps, None, rstd, z_rms, group_size=dim//ctx.ngroups, norm_before_gate=ctx.norm_before_gate, is_rms_norm=True, recompute_output=recompute_output, dz=dz, out=out1_recompute if recompute_output else None)
+            out_for_linear = out_recompute if recompute_output else None
+            dout = rearrange(dout, "(b s) (h p) -> b s h p", b=batch, p=headdim)
+            dx, ddt, dA, dB, dC, dD, _, ddt_bias, dinitial_states = _mamba_chunk_scan_combined_bwd(
+                dout, x, dt, A, B, C, out, ctx.chunk_size, D=D, z=None, dt_bias=dt_bias, initial_states=initial_states, dfinal_states=dfinal_states, seq_idx=seq_idx, dt_softplus=True, dt_limit=ctx.dt_limit, dx=dx, ddt=ddt_given, dB=dB, dC=dC, output_activation=ctx.output_activation, threshold=ctx.threshold
+            )
+
+        # Backpropagate through the centering operation: dC w.r.t. uncentered C
+        # dC = dC - dC.mean(dim=-1, keepdim=True)
+        
+        # Copy gradients back into dxBC buffer
+        # dxBC.copy_(torch.cat([
+        #     rearrange(dx, "b l h p -> b l (h p)"),
+        #     rearrange(dB, "b l g n -> b l (g n)"),
+        #     rearrange(dC, "b l g n -> b l (g n)")
+        # ], dim=-1))
+        
+        if outproj_weight is not None:
+            doutproj_weight = torch.einsum("bso,bsd->od", dout_og, out_for_linear)
+            doutproj_bias = dout_og.sum(dim=(0, 1)) if outproj_bias is not None else None
+        else:
+            doutproj_weight, doutproj_bias = None, None
+        # dxBC_given = rearrange(dxBC_given, "b s d -> b d s")
+        dxBC = dxBC * F.sigmoid(xBC_old) * ( 1 + xBC_old * (1 - F.sigmoid(xBC_old))) if ctx.activation in ["silu", "swish"] else dxBC
+        dxBC_given.copy_(dxBC)
+        # dxBC_given_update, dweight, dbias, *_ = causal_conv1d_bwd_function(
+            # rearrange_and_update_stride(xBC, "b s d -> b d s"), conv1d_weight, conv1d_bias,
+            # rearrange(dxBC, "b s d -> b d s"), seq_idx, None, None, rearrange_and_update_stride(dxBC_given), False, True if ctx.activation in ["silu", "swish"] else False
+        # )
+        # if dxBC_given.stride() != dxBC_given_update.stride():
+            # dxBC_given.copy_(dxBC_given_update)
+        # else:
+            # dxBC_given = dxBC_given_update
+        # dweight, dbias = torch.zeros_like(conv1d_weight), torch.zeros_like(conv1d_bias)
+        # dxBC_given = rearrange(dxBC_given, "b d s -> b s d")
+        return dzxbcdt, dweight, dbias, ddt_bias, dA, dD, None, dinitial_states, None, None, None, None, drmsnorm_weight, None, doutproj_weight, doutproj_bias, None, None, None, None, None, None
+
+
+
+def mamba_split_scan_combined(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states=None, seq_idx=None, dt_limit=(0.0, float("inf")), return_final_states=False, activation="silu", rmsnorm_weight=None, rmsnorm_eps=1e-6, outproj_weight=None, outproj_bias=None, headdim=None, ngroups=1, norm_before_gate=True, return_activation_sparsity = False, output_activation = None, threshold = None):
+    """
+    Argument:
+        zxbcdt: (batch, seqlen, 2 * dim + 2 * ngroups * dstate + nheads) where dim == nheads * headdim
+        conv1d_weight: (dim + 2 * ngroups * dstate, width)
+        conv1d_bias: (dim + 2 * ngroups * dstate,)
+        dt_bias: (nheads,)
+        A: (nheads)
+        D: (nheads, headdim) or (nheads,)
+        initial_states: (batch, nheads, headdim, dstate)
+        seq_idx: (batch, seqlen), int32
+        rmsnorm_weight: (dim,)
+        outproj_weight: (out_dim, dim)
+        outproj_bias: (out_dim,)
+        headdim: if D is 1D, headdim must be passed in
+        norm_before_gate: if True, we do RMSNorm(x) * F.silu(z). If False, we do RMSNorm(x * F.silu(z))
+    Return:
+        out: (batch, seqlen, dim)
+    """
+    return MambaSplitConv1dScanCombinedFn.apply(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states, seq_idx, dt_limit, return_final_states, activation, rmsnorm_weight, rmsnorm_eps, outproj_weight, outproj_bias, headdim, ngroups, norm_before_gate, return_activation_sparsity, output_activation, threshold)
