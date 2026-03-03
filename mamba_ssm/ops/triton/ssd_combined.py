@@ -1486,12 +1486,14 @@ class MambaSplitConv1dScanCombinedDeltaFn(torch.autograd.Function):
         assert A.shape == (nheads,)
         zx0, z, xBC, dt = torch.split(zxbcdt, [2 * d_nonssm, dim, dim + ngroups * dstate * 2, nheads], dim=-1)
         seq_idx = seq_idx.contiguous() if seq_idx is not None else None
-        xBC_conv = rearrange(
-            causal_conv1d_fwd_function(rearrange_and_update_stride(xBC, "b s d -> b d s"),
-                                                 conv1d_weight, conv1d_bias, seq_idx, None, None, True if activation in ["silu", "swish"] else None),
-            "b d s -> b s d"
-        )
-        x, B, C = torch.split(xBC_conv, [dim, ngroups * dstate, ngroups * dstate], dim=-1)
+        # xBC_conv = rearrange(
+            # causal_conv1d_fwd_function(rearrange_and_update_stride(xBC, "b s d -> b d s"),
+                                                #  conv1d_weight, conv1d_bias, seq_idx, None, None, True if activation in ["silu", "swish"] else None),
+            # "b d s -> b s d"
+        # )
+        xBC = F.silu(xBC) if activation in ["silu", "swish"] else xBC
+
+        x, B, C = torch.split(xBC, [dim, ngroups * dstate, ngroups * dstate], dim=-1)
         x = rearrange(x, "b l (h p) -> b l h p", h=nheads)
         B = rearrange(B, "b l (g n) -> b l g n", g=ngroups)
         C = rearrange(C, "b l (g n) -> b l g n", g=ngroups)
@@ -1676,15 +1678,21 @@ class MambaSplitConv1dScanCombinedDeltaFn(torch.autograd.Function):
             out0_recompute, out1_recompute = out_recompute.split([d_nonssm, dim], dim=-1)
         
         # Recompute x, B, C
-        xBC_conv = rearrange(
-            causal_conv1d_fwd_function(rearrange_and_update_stride(xBC, "b s d -> b d s"),
-                                       conv1d_weight, conv1d_bias, seq_idx, None, None, True if ctx.activation in ["silu", "swish"] else False),
-            "b d s -> b s d"
-        )
-        x, B, C = torch.split(xBC_conv, [dim, ctx.ngroups * dstate, ctx.ngroups * dstate], dim=-1)
+        xBC_old = xBC
+        xBC = F.silu(xBC) if ctx.activation in ["silu", "swish"] else xBC
+        x, B, C = torch.split(xBC, [dim, ctx.ngroups * dstate, ctx.ngroups * dstate], dim=-1)
         x = rearrange(x, "b l (h p) -> b l h p", h=nheads)
         B = rearrange(B, "b l (g n) -> b l g n", g=ctx.ngroups)
         C = rearrange(C, "b l (g n) -> b l g n", g=ctx.ngroups)
+        # xBC_conv = rearrange(
+        #     causal_conv1d_fwd_function(rearrange_and_update_stride(xBC, "b s d -> b d s"),
+        #                                conv1d_weight, conv1d_bias, seq_idx, None, None, True if ctx.activation in ["silu", "swish"] else False),
+        #     "b d s -> b s d"
+        # )
+        # x, B, C = torch.split(xBC_conv, [dim, ctx.ngroups * dstate, ctx.ngroups * dstate], dim=-1)
+        # x = rearrange(x, "b l (h p) -> b l h p", h=nheads)
+        # B = rearrange(B, "b l (g n) -> b l g n", g=ctx.ngroups)
+        # C = rearrange(C, "b l (g n) -> b l g n", g=ctx.ngroups)
         
         dzxbcdt = torch.empty_like(zxbcdt)
         dzx0, dz, dxBC_given, ddt_given = torch.split(dzxbcdt, [2 * d_nonssm, dim, dim + 2 * ctx.ngroups * dstate, nheads], dim=-1)
@@ -1739,17 +1747,23 @@ class MambaSplitConv1dScanCombinedDeltaFn(torch.autograd.Function):
 
         
         # Backward through conv1d
-        dxBC_given = rearrange(dxBC_given, "b s d -> b d s")
-        dxBC_given_update, dweight, dbias, *_ = causal_conv1d_bwd_function(
-            rearrange_and_update_stride(xBC, "b s d -> b d s"), conv1d_weight, conv1d_bias,
-            rearrange(dxBC, "b s d -> b d s"), seq_idx, None, None, rearrange_and_update_stride(dxBC_given), False, True if ctx.activation in ["silu", "swish"] else False
-        )
-        if dxBC_given.stride() != dxBC_given_update.stride():
-            dxBC_given.copy_(dxBC_given_update)
-        else:
-            dxBC_given = dxBC_given_update
-        dxBC_given = rearrange(dxBC_given, "b d s -> b s d")
+        # dxBC_given = rearrange(dxBC_given, "b s d -> b d s")
+        # dxBC_given_update, dweight, dbias, *_ = causal_conv1d_bwd_function(
+        #     rearrange_and_update_stride(xBC, "b s d -> b d s"), conv1d_weight, conv1d_bias,
+        #     rearrange(dxBC, "b s d -> b d s"), seq_idx, None, None, rearrange_and_update_stride(dxBC_given), False, True if ctx.activation in ["silu", "swish"] else False
+        # )
+        # if dxBC_given.stride() != dxBC_given_update.stride():
+        #     dxBC_given.copy_(dxBC_given_update)
+        # else:
+        #     dxBC_given = dxBC_given_update
+        # dxBC_given = rearrange(dxBC_given, "b d s -> b s d")
         
+        dxBC = dxBC * F.sigmoid(xBC_old) * ( 1 + xBC_old * (1 - F.sigmoid(xBC_old))) if ctx.activation in ["silu", "swish"] else dxBC
+        dxBC_given.copy_(dxBC)
+        dweight, dbias = torch.zeros_like(conv1d_weight), torch.zeros_like(conv1d_bias)
+
+        
+
         return dzxbcdt, dweight, dbias, ddt_bias, dA, dD, None, dinitial_states, None, None, None, None, drmsnorm_weight, None, doutproj_weight, doutproj_bias, None, None, None, None, None, None
 
 
@@ -3004,7 +3018,7 @@ class MambaSplitScanCombinedFn(torch.autograd.Function):
             # "b d s -> b s d"
         # )
         # x, B, C = torch.split(xBC_conv, [dim, ctx.ngroups * dstate, ctx.ngroups * dstate], dim=-1)
-        xBC_old = xBC.copy()
+        xBC_old = xBC
         xBC = F.silu(xBC) if ctx.activation in ["silu", "swish"] else xBC
         x, B, C = torch.split(xBC, [dim, ctx.ngroups * dstate, ctx.ngroups * dstate], dim=-1)
         x = rearrange(x, "b l (h p) -> b l h p", h=nheads)
@@ -3080,7 +3094,7 @@ class MambaSplitScanCombinedFn(torch.autograd.Function):
             # dxBC_given.copy_(dxBC_given_update)
         # else:
             # dxBC_given = dxBC_given_update
-        # dweight, dbias = torch.zeros_like(conv1d_weight), torch.zeros_like(conv1d_bias)
+        dweight, dbias = torch.zeros_like(conv1d_weight), torch.zeros_like(conv1d_bias)
         # dxBC_given = rearrange(dxBC_given, "b d s -> b s d")
         return dzxbcdt, dweight, dbias, ddt_bias, dA, dD, None, dinitial_states, None, None, None, None, drmsnorm_weight, None, doutproj_weight, doutproj_bias, None, None, None, None, None, None
 
@@ -3105,4 +3119,4 @@ def mamba_split_scan_combined(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D,
     Return:
         out: (batch, seqlen, dim)
     """
-    return MambaSplitConv1dScanCombinedFn.apply(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states, seq_idx, dt_limit, return_final_states, activation, rmsnorm_weight, rmsnorm_eps, outproj_weight, outproj_bias, headdim, ngroups, norm_before_gate, return_activation_sparsity, output_activation, threshold)
+    return MambaSplitScanCombinedFn.apply(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states, seq_idx, dt_limit, return_final_states, activation, rmsnorm_weight, rmsnorm_eps, outproj_weight, outproj_bias, headdim, ngroups, norm_before_gate, return_activation_sparsity, output_activation, threshold)
