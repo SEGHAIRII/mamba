@@ -1258,6 +1258,7 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
             else:
                 out = out01
         ctx.outproj_weight_dtype = outproj_weight.dtype if outproj_weight is not None else None
+        mask_ht = None
         if outproj_weight is not None:
             if torch.is_autocast_enabled():
                 dtype = torch.get_autocast_gpu_dtype()
@@ -1468,7 +1469,7 @@ class MambaSplitConv1dScanCombinedDeltaFn(torch.autograd.Function):
     @custom_fwd
     def forward(ctx, zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states=None, seq_idx=None, dt_limit=(0.0, float("inf")), return_final_states=False, activation="silu",
                 rmsnorm_weight=None, rmsnorm_eps=1e-6, outproj_weight=None, outproj_bias=None, headdim=None,
-                ngroups=1, norm_before_gate=True, return_activation_sparsity = False, output_activation = None, threshold = 0.1):
+                ngroups=1, norm_before_gate=True, return_activation_sparsity = False, output_activation = None, threshold = 0.1, apply_thresholding = True):
         # assert activation in [None, "silu", "swish", "relu"]
         if D.dim() == 1:
             assert headdim is not None
@@ -1536,6 +1537,19 @@ class MambaSplitConv1dScanCombinedDeltaFn(torch.autograd.Function):
                 out = rearrange(out, "(b s) d -> b s d", b=batch)
             else:
                 out = out01
+        threshold_tensor = None
+        if isinstance(threshold, torch.Tensor):
+            threshold_tensor = threshold.detach().to(device=out.device, dtype=out.dtype)
+        else:
+            threshold_value = 0.0 if threshold is None else threshold
+            threshold_tensor = torch.tensor(threshold_value, device=out.device, dtype=out.dtype)
+        quant_aux = torch.zeros_like(out)
+        if isinstance(threshold, torch.Tensor):
+            threshold_tensor = threshold.detach().to(device=out.device, dtype=out.dtype)
+        else:
+            threshold_value = 0.0 if threshold is None else threshold
+            threshold_tensor = torch.tensor(threshold_value, device=out.device, dtype=out.dtype)
+        out_prequant_aux = out
         ctx.outproj_weight_dtype = outproj_weight.dtype if outproj_weight is not None else None
         if outproj_weight is not None:
             if torch.is_autocast_enabled():
@@ -1547,22 +1561,30 @@ class MambaSplitConv1dScanCombinedDeltaFn(torch.autograd.Function):
                     out[:, :-1, :]  # Shift by 1 position
                 ], dim=1)
                 
-            delta = out - out_prev
-            # diff_norm = torch.abs(diff)
-            # is_changed = (diff_norm > threshold)
-            # delta = torch.where(is_changed, diff, torch.zeros_like(diff))
+            diff = out - out_prev
+            if apply_thresholding:
+                tau = threshold if isinstance(threshold, torch.Tensor) else torch.tensor(threshold, device=diff.device, dtype=diff.dtype)
+                mask_ht = (diff.abs() >= tau)
+                delta = diff * mask_ht.to(diff.dtype)
+            else:
+                mask_ht = torch.ones_like(diff, dtype=torch.bool)
+                delta = diff
+
             if return_activation_sparsity:
                 activation_sparsity = calculate_activation_sparsity(delta)  
             current_out = F.linear(delta, outproj_weight, outproj_bias)
             out = torch.cumsum(current_out, dim=1)  
-            # out = F.linear(out, outproj_weight, outproj_bias)
-            regularization_term = (delta**2).sum(dim=-1).mean()
-            # Also calculate L2 norm
+            regularization_term = (diff**2).sum(dim=-1).mean()
         else:
             assert outproj_bias is None
+            diff = torch.zeros(1, device=zxbcdt.device, dtype=zxbcdt.dtype)
+            mask_ht = torch.ones_like(diff, dtype=torch.bool)
+            regularization_term = torch.zeros((), device=zxbcdt.device, dtype=zxbcdt.dtype)
         ctx.save_for_backward(zxbcdt, conv1d_weight, conv1d_bias,
-                              out_x, A, D, dt_bias, initial_states, seq_idx, rmsnorm_weight, rstd, outproj_weight, outproj_bias)
+                              out_x, A, D, dt_bias, initial_states, seq_idx, rmsnorm_weight, rstd, outproj_weight, outproj_bias, diff, mask_ht)
         ctx.dt_limit = dt_limit
+        ctx.threshold = threshold
+        ctx.apply_thresholding = apply_thresholding
         ctx.return_final_states = return_final_states
         ctx.activation = activation
         ctx.rmsnorm_eps = rmsnorm_eps
@@ -1571,8 +1593,9 @@ class MambaSplitConv1dScanCombinedDeltaFn(torch.autograd.Function):
         ctx.headdim = headdim
         ctx.ngroups = ngroups
         ctx.output_activation = output_activation
+        # ctx.threshold_beta = 20.0
         #delta
-        ctx.threshold = threshold
+        # ctx.threshold = threshold
         # return out if not return_final_states else (out, final_states) if not return_activation_sparsity else (out, final_states, activation_sparsity)
         if not (return_final_states or return_activation_sparsity):
             return out
@@ -1581,12 +1604,12 @@ class MambaSplitConv1dScanCombinedDeltaFn(torch.autograd.Function):
             out = out + (final_states, )
         if return_activation_sparsity:
             out = out + (activation_sparsity, )
-        return out + (regularization_term, )
+        return out + (regularization_term, diff)
 
     @staticmethod
     @custom_bwd
     def backward(ctx, dout, *args):
-        zxbcdt, conv1d_weight, conv1d_bias, out, A, D, dt_bias, initial_states, seq_idx, rmsnorm_weight, rstd, outproj_weight, outproj_bias = ctx.saved_tensors
+        zxbcdt, conv1d_weight, conv1d_bias, out, A, D, dt_bias, initial_states, seq_idx, rmsnorm_weight, rstd, outproj_weight, outproj_bias, diff, mask_hard = ctx.saved_tensors
         dfinal_states = args[0] if ctx.return_final_states else None
         headdim = ctx.headdim
         nheads = D.shape[0]
@@ -1603,72 +1626,22 @@ class MambaSplitConv1dScanCombinedDeltaFn(torch.autograd.Function):
         # Delta encoding backward pass
         dcurrent_out = None
         delta = None
+        dthreshold = None
         if outproj_weight is not None:
             dout_og = dout
-            
-            # Recompute the actual input to output projection (after RMSNorm/gating)
-            if rmsnorm_weight is None:
-                # No RMSNorm case: out_x was just rearranged and possibly concatenated with non-SSM
-                out_for_delta = rearrange(out, "b s h p -> b s (h p)")
-                if d_nonssm > 0:
-                    # Recompute non-SSM part
-                    if ctx.activation in ["silu", "swish"]:
-                        nonssm_out = _swiglu_fwd(zx0)
-                    else:
-                        nonssm_out = _reglu_fwd(zx0)
-                    out_for_delta = torch.cat([nonssm_out, out_for_delta], dim=-1)
-            else:
-                # RMSNorm case: need to recompute RMSNorm output
-                x_rms = rearrange(out, "b s h p -> (b s) (h p)")
-                z_rms = rearrange(z, "b s h p -> (b s) (h p)")
-                
-                if d_nonssm == 0:
-                    out_for_delta_temp = None
-                else:
-                    batch = out.shape[0]
-                    seqlen = out.shape[1]
-                    out_for_delta_01 = torch.empty((batch, seqlen, d_nonssm + dim), device=out.device, dtype=out.dtype)
-                    out_for_delta_temp = rearrange(out_for_delta_01[..., d_nonssm:], "b s d -> (b s) d")
-                    if ctx.activation in ["silu", "swish"]:
-                        out_for_delta_01[..., :d_nonssm] = _swiglu_fwd(zx0, out=out_for_delta_01[..., :d_nonssm])
-                    elif ctx.activation == "relu":
-                        out_for_delta_01[..., :d_nonssm] = _reglu_fwd(zx0, out=out_for_delta_01[..., :d_nonssm])
-                
-                out_for_delta_temp, _, _ = _layer_norm_fwd(x_rms, rmsnorm_weight, None, ctx.rmsnorm_eps, z_rms, 
-                                                             out=out_for_delta_temp, group_size=dim//ctx.ngroups,
-                                                             norm_before_gate=ctx.norm_before_gate, is_rms_norm=True)
-                if d_nonssm == 0:
-                    out_for_delta = rearrange(out_for_delta_temp, "(b s) d -> b s d", b=out.shape[0])
-                else:
-                    out_for_delta = out_for_delta_01
-            
-            # Recompute delta from the correct pre-projection tensor
-            # out_prev = torch.cat([
-            #     torch.zeros_like(out_for_delta[:, :1, :]),
-            #     out_for_delta[:, :-1, :]
-            # ], dim=1)
-            # diff = out_for_delta - out_prev
-            # is_changed = (torch.abs(diff) > ctx.threshold).float()
-            # delta = diff * is_changed
-            
-            out_prev = torch.cat([
-                torch.zeros_like(out_for_delta[:, :1, :]),
-                out_for_delta[:, :-1, :]
-            ], dim=1)
-            delta = out_for_delta - out_prev
-            
+            mask_hard_f = mask_hard.to(diff.dtype) if mask_hard is not None else torch.ones_like(diff)
+            delta = diff * mask_hard_f
+
             # Backprop through cumsum: gradient of cumsum is reverse cumsum
             dcurrent_out = torch.flip(torch.cumsum(torch.flip(dout_og, dims=[1]), dim=1), dims=[1])
-            
+
             # Backprop through linear projection
             ddelta = F.linear(dcurrent_out, outproj_weight.t())
-            
-            # Backprop through masking
-            # ddiff = ddelta * is_changed
-            
+            ddiff = ddelta * mask_hard_f
+
             # Backprop through diff = out - out_prev
-            dout = ddelta.clone()
-            dout_prev = -ddelta
+            dout = ddiff.clone()
+            dout_prev = -ddiff
             dout[:, :-1, :] += dout_prev[:, 1:, :]
         
         # Standard backward pass setup
@@ -1764,10 +1737,10 @@ class MambaSplitConv1dScanCombinedDeltaFn(torch.autograd.Function):
 
         
 
-        return dzxbcdt, dweight, dbias, ddt_bias, dA, dD, None, dinitial_states, None, None, None, None, drmsnorm_weight, None, doutproj_weight, doutproj_bias, None, None, None, None, None, None
+        return dzxbcdt, dweight, dbias, ddt_bias, dA, dD, None, dinitial_states, None, None, None, None, drmsnorm_weight, None, doutproj_weight, doutproj_bias, None, None, None, None, None, dthreshold, None
 
 
-def mamba_split_conv1d_scan_combined_Delta(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states=None, seq_idx=None, dt_limit=(0.0, float("inf")), return_final_states=False, activation="silu", rmsnorm_weight=None, rmsnorm_eps=1e-6, outproj_weight=None, outproj_bias=None, headdim=None, ngroups=1, norm_before_gate=True, return_activation_sparsity = False, output_activation = None, threshold = None):
+def mamba_split_conv1d_scan_combined_Delta(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states=None, seq_idx=None, dt_limit=(0.0, float("inf")), return_final_states=False, activation="silu", rmsnorm_weight=None, rmsnorm_eps=1e-6, outproj_weight=None, outproj_bias=None, headdim=None, ngroups=1, norm_before_gate=True, return_activation_sparsity = False, output_activation = None, threshold = None, apply_thresholding = True):
     """
     Argument:
         zxbcdt: (batch, seqlen, 2 * dim + 2 * ngroups * dstate + nheads) where dim == nheads * headdim
@@ -1786,17 +1759,344 @@ def mamba_split_conv1d_scan_combined_Delta(zxbcdt, conv1d_weight, conv1d_bias, d
     Return:
         out: (batch, seqlen, dim)
     """
-    return MambaSplitConv1dScanCombinedDeltaFn.apply(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states, seq_idx, dt_limit, return_final_states, activation, rmsnorm_weight, rmsnorm_eps, outproj_weight, outproj_bias, headdim, ngroups, norm_before_gate, return_activation_sparsity, output_activation, threshold)
+    return MambaSplitConv1dScanCombinedDeltaFn.apply(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states, seq_idx, dt_limit, return_final_states, activation, rmsnorm_weight, rmsnorm_eps, outproj_weight, outproj_bias, headdim, ngroups, norm_before_gate, return_activation_sparsity, output_activation, threshold, apply_thresholding)
 
 
 #==========================================dr====================================
-class DR_SSM_SplitConv1dScanCombinedFn(torch.autograd.Function):
+# class DR_SSM_SplitConv1dScanCombinedFn(torch.autograd.Function):
+
+#     @staticmethod
+#     @custom_fwd
+#     def forward(ctx, zxbcdt, conv1d_weight, conv1d_bias, D, chunk_size, initial_states=None, seq_idx=None, return_final_states=False, activation="silu",
+#                 rmsnorm_weight=None, rmsnorm_eps=1e-6, outproj_weight=None, outproj_bias=None, headdim=None,
+#                 ngroups=1, norm_before_gate=True, return_activation_sparsity = False, output_activation = None, threshold=0.0):
+#         # assert activation in [None, "silu", "swish", "relu"]
+#         if D.dim() == 1:
+#             assert headdim is not None
+#             nheads, = D.shape
+#         else:
+#             nheads, headdim = D.shape
+#         batch, seqlen, _ = zxbcdt.shape
+#         dim = nheads * headdim
+#         assert nheads % ngroups == 0
+#         dstate = (conv1d_weight.shape[0] - dim) // ngroups // 2
+#         d_nonssm = (zxbcdt.shape[-1] - 5 * dim - 2 * ngroups * dstate) // 2
+#         assert d_nonssm >= 0
+#         assert zxbcdt.shape == (batch, seqlen, 2 * d_nonssm + 5 * dim + 2 * ngroups * dstate)
+#         print('we are here hhhhhhhhhhhhhhh')
+#         zx0, z, E, I, A, xBC = torch.split(zxbcdt, [2 * d_nonssm, dim,dim,dim,dim, dim + ngroups * dstate * 2], dim=-1)
+#         seq_idx = seq_idx.contiguous() if seq_idx is not None else None
+#         xBC_conv = rearrange(
+#             causal_conv1d_fwd_function(rearrange_and_update_stride(xBC, "b s d -> b d s"),
+#                                                  conv1d_weight, conv1d_bias, seq_idx, None, None, True if activation in ["silu", "swish"] else None),
+#             "b d s -> b s d"
+#         )
+#         x, B, C = torch.split(xBC_conv, [dim, ngroups * dstate, ngroups * dstate], dim=-1)
+#         x = rearrange(x, "b l (h p) -> b l h p", h=nheads)
+#         B = rearrange(B, "b l (g n) -> b l g n", g=ngroups)
+#         C = rearrange(C, "b l (g n) -> b l g n", g=ngroups)
+#         z = rearrange(z, "b l (h p) -> b l h p", h=nheads) if z is not None else None
+#         E = rearrange(E, "b l (h p) -> b l h p", h=nheads)
+#         I = rearrange(I, "b l (h p) -> b l h p", h=nheads)
+#         A = rearrange(A, "b l (h p) -> b l h p", h=nheads)
+#         A = -F.softplus(A)
+#         E = F.relu(E)
+#         I = F.softplus(I)
+        
+#         if rmsnorm_weight is None:
+#             out, out_x, sigma_squared_sum, dA_cumsum, states, final_states, x_masked, M, sigmoid_delta, E_mean = _dr_ssm_chunk_scan_combined_fwd(x, A, B, C, E, I, chunk_size=chunk_size, D=D, z=z, initial_states=initial_states, seq_idx=seq_idx,  output_activation=output_activation, threshold=threshold)
+#             if return_activation_sparsity:
+#                 activation_sparsity = calculate_activation_sparsity(rearrange(out_x, "b s h p -> b s (h p)"))  
+#             out = rearrange(out, "b s h p -> b s (h p)")
+#             rstd = None
+#             if d_nonssm > 0:
+#                 if activation in ["silu", "swish"]:
+#                     out = torch.cat([_swiglu_fwd(zx0), out], dim=-1)
+#                 else:
+#                     out = torch.cat([_reglu_fwd(zx0), out], dim=-1)
+#         else:
+#             out, out_x, sigma_squared_sum, dA_cumsum, states, final_states, x_masked, M, sigmoid_delta, E_mean = _dr_ssm_chunk_scan_combined_fwd(x, A, B, C, E, I, chunk_size=chunk_size, D=D, z=None, initial_states=initial_states, seq_idx=seq_idx, output_activation=output_activation, threshold=threshold)
+#             # When z=None, out_x is None, so use out instead for the computations
+#             out_x = out  # Use out as out_x since z=None means no gating
+#             # reshape input data into 2D tensor
+#             if return_activation_sparsity:
+#                 activation_sparsity = calculate_activation_sparsity(rearrange(out_x, "b s h p -> b s (h p)"))  
+#             # rearranged_x = rearrange(out_x, "b s h p -> b s (h p)")
+#             # total_0 = (rearranged_x[-1] == 0).float().mean(-1).mean()
+#             # print(total_0)
+#             x_rms = rearrange(out_x, "b s h p -> (b s) (h p)")
+#             z_rms = rearrange(z, "b s h p -> (b s) (h p)")
+#             rmsnorm_weight = rmsnorm_weight.contiguous()
+#             if d_nonssm == 0:
+#                 out = None
+#             else:
+#                 out01 = torch.empty((batch, seqlen, d_nonssm + dim), dtype=x_rms.dtype, device=x_rms.device)
+#                 out = rearrange(out01[..., d_nonssm:], "b s d -> (b s) d")
+#                 if activation == "silu" or activation == "swish":
+#                     out01[..., :d_nonssm] = _swiglu_fwd(zx0, out=out01[..., :d_nonssm])
+#                 elif activation == "relu":
+#                     out01[..., :d_nonssm] = _reglu_fwd(zx0, out=out01[..., :d_nonssm])
+                    
+#             out, _, rstd = _layer_norm_fwd(x_rms, rmsnorm_weight, None, rmsnorm_eps, z_rms, out=out,
+#                                            group_size=dim // ngroups,
+#                                            norm_before_gate=norm_before_gate, is_rms_norm=True)
+#             if d_nonssm == 0:
+#                 out = rearrange(out, "(b s) d -> b s d", b=batch)
+#             else:
+#                 out = out01
+#         ctx.outproj_weight_dtype = outproj_weight.dtype if outproj_weight is not None else None
+        
+#         # apply delta rule on y
+#         if outproj_weight is not None:
+#             # Force dtype alignment between activations and weights regardless of autocast
+#             target_dtype = outproj_weight.dtype
+#             if out.dtype != target_dtype:
+#                 out = out.to(target_dtype)
+            
+#             out_prev = torch.cat([
+#                 torch.zeros_like(out[:, :1, :]),  # First token has no previous
+#                 out[:, :-1, :]  # Shift by 1 position
+#             ], dim=1)
+            
+#             diff = out - out_prev
+#             diff_norm = torch.abs(diff)
+#             is_changed = (diff_norm > threshold)
+#             delta = torch.where(is_changed, diff, torch.zeros_like(diff))             
+#             # Ensure bias matches weight dtype
+#             bias = outproj_bias.to(target_dtype) if outproj_bias is not None else None
+            
+#             current_out = F.linear(delta, outproj_weight, bias)
+#             out = torch.cumsum(current_out, dim=1)
+#             # out = F.linear(out, outproj_weight, outproj_bias)
+#         else:
+#             assert outproj_bias is None
+#         ctx.save_for_backward(zxbcdt, conv1d_weight, conv1d_bias,
+#                               out_x, D, initial_states, seq_idx, rmsnorm_weight, rstd, outproj_weight, outproj_bias)
+#         # ctx.dt_limit = dt_limit
+#         ctx.return_final_states = return_final_states
+#         ctx.activation = activation
+#         ctx.rmsnorm_eps = rmsnorm_eps
+#         ctx.norm_before_gate = norm_before_gate
+#         ctx.chunk_size = chunk_size
+#         ctx.headdim = headdim
+#         ctx.ngroups = ngroups
+#         ctx.output_activation = output_activation
+#         ctx.threshold = threshold
+#         # return out if not return_final_states else (out, final_states) if not return_activation_sparsity else (out, final_states, activation_sparsity)
+#         if not (return_final_states or return_activation_sparsity):
+#             return out
+#         # Reduce sigma_squared_sum to scalar for regularization loss
+#         regularization_scalar = sigma_squared_sum.mean()
+#         out = (out, regularization_scalar)
+#         if return_final_states:
+#             out = out + (final_states, )
+#         if return_activation_sparsity:
+#             out = out + (activation_sparsity, )
+#         return out
+
+#     @staticmethod
+#     @custom_bwd
+#     def backward(ctx, dout, *args):
+#         zxbcdt, conv1d_weight, conv1d_bias, out, D, initial_states, seq_idx, rmsnorm_weight, rstd, outproj_weight, outproj_bias = ctx.saved_tensors
+#         dfinal_states = args[0] if ctx.return_final_states else None
+#         headdim = ctx.headdim
+#         nheads = D.shape[0]
+#         dim = nheads * headdim
+#         dstate = (conv1d_weight.shape[0] - dim) // ctx.ngroups // 2
+#         d_nonssm = (zxbcdt.shape[-1] - 5 * dim - 2 * ctx.ngroups * dstate) // 2
+#         assert nheads % ctx.ngroups == 0
+#         try:
+#             assert zxbcdt.shape == (dout.shape[0], dout.shape[1], 2 * d_nonssm + 5 * dim + 2 * ctx.ngroups * dstate)
+#         except AssertionError as e:
+#             print("Shape mismatch in backward:", zxbcdt.shape)
+        
+#         assert d_nonssm >= 0
+#         recompute_output = outproj_weight is not None
+#         if recompute_output:
+#             out_recompute = torch.empty(*out.shape[:2], d_nonssm + dim, device=out.device, dtype=out.dtype)
+#             out0_recompute, out1_recompute = out_recompute.split([d_nonssm, dim], dim=-1)
+#         zx0, z, E, I, A, xBC = torch.split(zxbcdt, [2 * d_nonssm, dim,dim, dim, dim, dim + 2 * ctx.ngroups * dstate], dim=-1)
+#         # Recompute x, B, C
+#         xBC_conv = rearrange(
+#             causal_conv1d_fwd_function(rearrange_and_update_stride(xBC, "b s d -> b d s"),
+#                                        conv1d_weight, conv1d_bias, seq_idx, None, None, True if ctx.activation in ["silu", "swish"] else False),
+#             "b d s -> b s d"
+#         )
+#         x, B, C = torch.split(xBC_conv, [dim, ctx.ngroups * dstate, ctx.ngroups * dstate], dim=-1)
+#         x = rearrange(x, "b l (h p) -> b l h p", h=nheads)
+#         B = rearrange(B, "b l (g n) -> b l g n", g=ctx.ngroups)
+#         C = rearrange(C, "b l (g n) -> b l g n", g=ctx.ngroups)
+#         E = rearrange(E, "b l (h p) -> b l h p", h=nheads)
+#         I = rearrange(I, "b l (h p) -> b l h p", h=nheads)
+#         A = rearrange(A, "b l (h p) -> b l h p", h=nheads)
+#         A = -F.softplus(A)
+#         E = F.relu(E)
+#         I = F.softplus(I)
+        
+#         dzxbcdt = torch.empty_like(zxbcdt)
+#         dzx0, dz,dE_given, dI_given, dA_given, dxBC_given = torch.split(dzxbcdt, [2 * d_nonssm, dim,dim, dim, dim, dim + 2 * ctx.ngroups * dstate], dim=-1)
+#         dxBC = torch.empty_like(xBC)
+#         dx, dB, dC = torch.split(dxBC, [dim, ctx.ngroups * dstate, ctx.ngroups * dstate], dim=-1)
+#         z = rearrange(z, "b l (h p) -> b l h p", h=nheads)
+#         dx = rearrange(dx, "b l (h p) -> b l h p", h=nheads)
+#         dB = rearrange(dB, "b l (g n) -> b l g n", g=ctx.ngroups)
+#         dC = rearrange(dC, "b l (g n) -> b l g n", g=ctx.ngroups)
+#         dE = rearrange(dE_given, "b l (h p) -> b l h p", h=nheads)
+#         dI = rearrange(dI_given, "b l (h p) -> b l h p", h=nheads)
+#         dA = rearrange(dA_given, "b l (h p) -> b l h p", h=nheads)
+        
+        
+#         dcurrent_out = None
+#         delta = None
+#         if outproj_weight is not None:
+#             dout_og = dout
+            
+#             # Recompute the actual input to output projection (after RMSNorm/gating)
+#             if rmsnorm_weight is None:
+#                 # No RMSNorm case: out_x was just rearranged and possibly concatenated with non-SSM
+#                 out_for_delta = rearrange(out, "b s h p -> b s (h p)")
+#                 if d_nonssm > 0:
+#                     # Recompute non-SSM part
+#                     if ctx.activation in ["silu", "swish"]:
+#                         nonssm_out = _swiglu_fwd(zx0)
+#                     else:
+#                         nonssm_out = _reglu_fwd(zx0)
+#                     out_for_delta = torch.cat([nonssm_out, out_for_delta], dim=-1)
+#             else:
+#                 # RMSNorm case: need to recompute RMSNorm output
+#                 x_rms = rearrange(out, "b s h p -> (b s) (h p)")
+#                 z_rms = rearrange(z, "b s h p -> (b s) (h p)")
+                
+#                 if d_nonssm == 0:
+#                     out_for_delta_temp = None
+#                 else:
+#                     batch = out.shape[0]
+#                     seqlen = out.shape[1]
+#                     out_for_delta_01 = torch.empty((batch, seqlen, d_nonssm + dim), device=out.device, dtype=out.dtype)
+#                     out_for_delta_temp = rearrange(out_for_delta_01[..., d_nonssm:], "b s d -> (b s) d")
+#                     if ctx.activation in ["silu", "swish"]:
+#                         out_for_delta_01[..., :d_nonssm] = _swiglu_fwd(zx0, out=out_for_delta_01[..., :d_nonssm])
+#                     elif ctx.activation == "relu":
+#                         out_for_delta_01[..., :d_nonssm] = _reglu_fwd(zx0, out=out_for_delta_01[..., :d_nonssm])
+                
+#                 out_for_delta_temp, _, _ = _layer_norm_fwd(x_rms, rmsnorm_weight, None, ctx.rmsnorm_eps, z_rms, 
+#                                                              out=out_for_delta_temp, group_size=dim//ctx.ngroups,
+#                                                              norm_before_gate=ctx.norm_before_gate, is_rms_norm=True)
+#                 if d_nonssm == 0:
+#                     out_for_delta = rearrange(out_for_delta_temp, "(b s) d -> b s d", b=out.shape[0])
+#                 else:
+#                     out_for_delta = out_for_delta_01
+            
+#             # Recompute delta from the correct pre-projection tensor
+#             out_prev = torch.cat([
+#                 torch.zeros_like(out_for_delta[:, :1, :]),
+#                 out_for_delta[:, :-1, :]
+#             ], dim=1)
+#             diff = out_for_delta - out_prev
+#             is_changed = (torch.abs(diff) > ctx.threshold).float()
+#             delta = diff * is_changed
+            
+#             # Backprop through cumsum: gradient of cumsum is reverse cumsum
+#             dcurrent_out = torch.flip(torch.cumsum(torch.flip(dout_og, dims=[1]), dim=1), dims=[1])
+            
+#             # Backprop through linear projection
+#             ddelta = F.linear(dcurrent_out, outproj_weight.t())
+            
+#             # Backprop through masking
+#             ddiff = ddelta * is_changed
+            
+#             # Backprop through diff = out - out_prev
+#             dout = ddiff.clone()
+#             dout_prev = -ddiff
+#             dout[:, :-1, :] += dout_prev[:, 1:, :]
+        
+        
+#         if d_nonssm > 0:
+#             dout0, dout = dout.split([d_nonssm, dim], dim=-1)
+#             if ctx.activation in ["silu", "swish"]:
+#                 _swiglu_bwd(zx0, dout0, dxy=dzx0, recompute_output=True, out=out0_recompute)
+#             elif ctx.activation == "relu":
+#                 _reglu_bwd(zx0, dout0, dxy=dzx0, recompute_output=True, out=out0_recompute)
+        
+#         dout = rearrange(dout, "b s (h p) -> b s h p", p=headdim)
+#         if rmsnorm_weight is None:
+#             dz = rearrange(dz, "b l (h p) -> b l h p", h=nheads)
+#             dx, ddt, dA, dB, dC, dD, dz, ddt_bias, dinitial_states, *rest = _mamba_chunk_scan_combined_bwd(
+#                 dout, x, dt, A, B, C, out, ctx.chunk_size, D=D, z=z, dt_bias=dt_bias, initial_states=initial_states, dfinal_states=dfinal_states, seq_idx=seq_idx, dt_softplus=True, dt_limit=ctx.dt_limit, dx=dx, ddt=ddt_given, dB=dB, dC=dC, dz=dz, recompute_output=recompute_output, output_activation=ctx.output_activation, threshold=ctx.threshold
+#             )
+#             out_for_linear = rearrange(rest[0], "b s h p -> b s (h p)") if recompute_output else None
+#             drmsnorm_weight = None
+#         else:
+#             batch = dout.shape[0]
+#             dy_rms = rearrange(dout, "b s h p -> (b s) (h p)")
+#             dz = rearrange(dz, "b l d -> (b l) d")
+#             x_rms = rearrange(out, "b s h p -> (b s) (h p)")
+#             z_rms = rearrange(z, "b s h p -> (b s) (h p)")
+#             out1_recompute = rearrange(out1_recompute, "b s d -> (b s) d") if recompute_output else None
+#             # backward through rmsnorm
+#             dout, drmsnorm_weight, _, dz, *rest = _layer_norm_bwd(dy_rms, x_rms, rmsnorm_weight, None, ctx.rmsnorm_eps, None, rstd, z_rms, group_size=dim//ctx.ngroups, norm_before_gate=ctx.norm_before_gate, is_rms_norm=True, recompute_output=recompute_output, dz=dz, out=out1_recompute if recompute_output else None)
+#             out_for_linear = out_recompute if recompute_output else None
+#             dout = rearrange(dout, "(b s) (h p) -> b s h p", b=batch, p=headdim)
+#             dx, dA, dB, dC, dD, _, dE,dI, dinitial_states = _dr_ssm_chunk_scan_combined_bwd(
+#                 dout, x, A, B, C,E, I, out, ctx.chunk_size, D=D, z=None, initial_states=initial_states, dfinal_states=dfinal_states, seq_idx=seq_idx,  dx=dx, dB=dB, dC=dC,dE = dE, dI = dI, dA = dA, output_activation=ctx.output_activation, threshold=ctx.threshold
+#             )
+            
+
+        
+#         if outproj_weight is not None:
+#             doutproj_weight = torch.einsum("bso,bsd->od", dcurrent_out, delta.to(dcurrent_out.dtype))
+#             doutproj_bias = dcurrent_out.sum(dim=(0, 1)) if outproj_bias is not None else None
+#         else:
+#             doutproj_weight, doutproj_bias = None, None
+            
+#         dxBC_given = rearrange(dxBC_given, "b s d -> b d s")
+#         dxBC_given_update, dweight, dbias, *_ = causal_conv1d_bwd_function(
+#             rearrange_and_update_stride(xBC, "b s d -> b d s"), conv1d_weight, conv1d_bias,
+#             rearrange(dxBC, "b s d -> b d s"), seq_idx, None, None, rearrange_and_update_stride(dxBC_given), False, True if ctx.activation in ["silu", "swish"] else False
+#         )
+#         if dxBC_given.stride() != dxBC_given_update.stride():
+#             dxBC_given.copy_(dxBC_given_update)
+#         else:
+#             dxBC_given = dxBC_given_update
+#         dxBC_given = rearrange(dxBC_given, "b d s -> b s d")
+        
+#         dI = dI * torch.sigmoid(I)
+#         dE = dE * (E > 0).float()
+#         dA = - dA * torch.sigmoid(-A)
+        
+#         return dzxbcdt, dweight, dbias, dD, None, dinitial_states, None, None, None, drmsnorm_weight, None, doutproj_weight, doutproj_bias, None, None, None, None, None, None
+
+
+# def DR_SSM_split_conv1d_scan_combined(zxbcdt, conv1d_weight, conv1d_bias, dt_bias,  chunk_size, initial_states=None, seq_idx=None, dt_limit=(0.0, float("inf")), return_final_states=False, activation="silu", rmsnorm_weight=None, rmsnorm_eps=1e-6, outproj_weight=None, outproj_bias=None, headdim=None, ngroups=1, norm_before_gate=True, return_activation_sparsity = False, output_activation = None, threshold = None):
+#     """
+#     Argument:
+#         zxbcdt: (batch, seqlen, 2 * dim + 2 * ngroups * dstate + nheads) where dim == nheads * headdim
+#         conv1d_weight: (dim + 2 * ngroups * dstate, width)
+#         conv1d_bias: (dim + 2 * ngroups * dstate,)
+#         dt_bias: (nheads,)
+#         A: (nheads)
+#         D: (nheads, headdim) or (nheads,)
+#         initial_states: (batch, nheads, headdim, dstate)
+#         seq_idx: (batch, seqlen), int32
+#         rmsnorm_weight: (dim,)
+#         outproj_weight: (out_dim, dim)
+#         outproj_bias: (out_dim,)
+#         headdim: if D is 1D, headdim must be passed in
+#         norm_before_gate: if True, we do RMSNorm(x) * F.silu(z). If False, we do RMSNorm(x * F.silu(z))
+#     Return:
+#         out: (batch, seqlen, dim)
+#     """
+#     return DR_SSM_SplitConv1dScanCombinedFn.apply(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states, seq_idx,  return_final_states, activation, rmsnorm_weight, rmsnorm_eps, outproj_weight, outproj_bias, headdim, ngroups, norm_before_gate, return_activation_sparsity, output_activation, threshold)
+
+
+
+class MambaSplitConv1dScanCombinedDeltaFn(torch.autograd.Function):
 
     @staticmethod
     @custom_fwd
-    def forward(ctx, zxbcdt, conv1d_weight, conv1d_bias, D, chunk_size, initial_states=None, seq_idx=None, return_final_states=False, activation="silu",
+    def forward(ctx, zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states=None, seq_idx=None, dt_limit=(0.0, float("inf")), return_final_states=False, activation="silu",
                 rmsnorm_weight=None, rmsnorm_eps=1e-6, outproj_weight=None, outproj_bias=None, headdim=None,
-                ngroups=1, norm_before_gate=True, return_activation_sparsity = False, output_activation = None, threshold=0.0):
+                ngroups=1, norm_before_gate=True, return_activation_sparsity = False, output_activation = None, threshold = 0.1, insert_quant = False):
         # assert activation in [None, "silu", "swish", "relu"]
         if D.dim() == 1:
             assert headdim is not None
@@ -1807,31 +2107,27 @@ class DR_SSM_SplitConv1dScanCombinedFn(torch.autograd.Function):
         dim = nheads * headdim
         assert nheads % ngroups == 0
         dstate = (conv1d_weight.shape[0] - dim) // ngroups // 2
-        d_nonssm = (zxbcdt.shape[-1] - 5 * dim - 2 * ngroups * dstate) // 2
+        d_nonssm = (zxbcdt.shape[-1] - 2 * dim - 2 * ngroups * dstate - nheads) // 2
         assert d_nonssm >= 0
-        assert zxbcdt.shape == (batch, seqlen, 2 * d_nonssm + 5 * dim + 2 * ngroups * dstate)
-        print('we are here hhhhhhhhhhhhhhh')
-        zx0, z, E, I, A, xBC = torch.split(zxbcdt, [2 * d_nonssm, dim,dim,dim,dim, dim + ngroups * dstate * 2], dim=-1)
+        assert zxbcdt.shape == (batch, seqlen, 2 * d_nonssm + 2 * dim + 2 * ngroups * dstate + nheads)
+        assert dt_bias.shape == (nheads,)
+        assert A.shape == (nheads,)
+        zx0, z, xBC, dt = torch.split(zxbcdt, [2 * d_nonssm, dim, dim + ngroups * dstate * 2, nheads], dim=-1)
         seq_idx = seq_idx.contiguous() if seq_idx is not None else None
-        xBC_conv = rearrange(
-            causal_conv1d_fwd_function(rearrange_and_update_stride(xBC, "b s d -> b d s"),
-                                                 conv1d_weight, conv1d_bias, seq_idx, None, None, True if activation in ["silu", "swish"] else None),
-            "b d s -> b s d"
-        )
-        x, B, C = torch.split(xBC_conv, [dim, ngroups * dstate, ngroups * dstate], dim=-1)
+        # xBC_conv = rearrange(
+            # causal_conv1d_fwd_function(rearrange_and_update_stride(xBC, "b s d -> b d s"),
+                                                #  conv1d_weight, conv1d_bias, seq_idx, None, None, True if activation in ["silu", "swish"] else None),
+            # "b d s -> b s d"
+        # )
+        xBC = F.silu(xBC) if activation in ["silu", "swish"] else xBC
+
+        x, B, C = torch.split(xBC, [dim, ngroups * dstate, ngroups * dstate], dim=-1)
         x = rearrange(x, "b l (h p) -> b l h p", h=nheads)
         B = rearrange(B, "b l (g n) -> b l g n", g=ngroups)
         C = rearrange(C, "b l (g n) -> b l g n", g=ngroups)
         z = rearrange(z, "b l (h p) -> b l h p", h=nheads) if z is not None else None
-        E = rearrange(E, "b l (h p) -> b l h p", h=nheads)
-        I = rearrange(I, "b l (h p) -> b l h p", h=nheads)
-        A = rearrange(A, "b l (h p) -> b l h p", h=nheads)
-        A = -F.softplus(A)
-        E = F.relu(E)
-        I = F.softplus(I)
-        
         if rmsnorm_weight is None:
-            out, out_x, sigma_squared_sum, dA_cumsum, states, final_states, x_masked, M, sigmoid_delta, E_mean = _dr_ssm_chunk_scan_combined_fwd(x, A, B, C, E, I, chunk_size=chunk_size, D=D, z=z, initial_states=initial_states, seq_idx=seq_idx,  output_activation=output_activation, threshold=threshold)
+            out, out_x, dt_out, dA_cumsum, states, final_states = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size=chunk_size, D=D, z=z, dt_bias=dt_bias, initial_states=initial_states, seq_idx=seq_idx, dt_softplus=True, dt_limit=dt_limit, output_activation=output_activation)
             if return_activation_sparsity:
                 activation_sparsity = calculate_activation_sparsity(rearrange(out_x, "b s h p -> b s (h p)"))  
             out = rearrange(out, "b s h p -> b s (h p)")
@@ -1842,12 +2138,9 @@ class DR_SSM_SplitConv1dScanCombinedFn(torch.autograd.Function):
                 else:
                     out = torch.cat([_reglu_fwd(zx0), out], dim=-1)
         else:
-            out, out_x, sigma_squared_sum, dA_cumsum, states, final_states, x_masked, M, sigmoid_delta, E_mean = _dr_ssm_chunk_scan_combined_fwd(x, A, B, C, E, I, chunk_size=chunk_size, D=D, z=None, initial_states=initial_states, seq_idx=seq_idx, output_activation=output_activation, threshold=threshold)
-            # When z=None, out_x is None, so use out instead for the computations
-            out_x = out  # Use out as out_x since z=None means no gating
+            out_x, _, dt_out, dA_cumsum, states, final_states = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size=chunk_size, D=D, z=None, dt_bias=dt_bias, initial_states=initial_states, seq_idx=seq_idx, dt_softplus=True, dt_limit=dt_limit, output_activation=output_activation)
             # reshape input data into 2D tensor
-            if return_activation_sparsity:
-                activation_sparsity = calculate_activation_sparsity(rearrange(out_x, "b s h p -> b s (h p)"))  
+            
             # rearranged_x = rearrange(out_x, "b s h p -> b s (h p)")
             # total_0 = (rearranged_x[-1] == 0).float().mean(-1).mean()
             # print(total_0)
@@ -1871,35 +2164,46 @@ class DR_SSM_SplitConv1dScanCombinedFn(torch.autograd.Function):
                 out = rearrange(out, "(b s) d -> b s d", b=batch)
             else:
                 out = out01
+        if isinstance(threshold, torch.Tensor):
+            threshold_tensor = threshold.detach().to(device=out.device, dtype=out.dtype)
+        else:
+            threshold_value = 0.0 if threshold is None else threshold
+            threshold_tensor = torch.tensor(threshold_value, device=out.device, dtype=out.dtype)
+        quant_aux = torch.zeros_like(out)
         ctx.outproj_weight_dtype = outproj_weight.dtype if outproj_weight is not None else None
-        
-        # apply delta rule on y
         if outproj_weight is not None:
-            # Force dtype alignment between activations and weights regardless of autocast
-            target_dtype = outproj_weight.dtype
-            if out.dtype != target_dtype:
-                out = out.to(target_dtype)
-            
-            out_prev = torch.cat([
-                torch.zeros_like(out[:, :1, :]),  # First token has no previous
-                out[:, :-1, :]  # Shift by 1 position
-            ], dim=1)
-            
-            diff = out - out_prev
-            diff_norm = torch.abs(diff)
-            is_changed = (diff_norm > threshold)
-            delta = torch.where(is_changed, diff, torch.zeros_like(diff))             
-            # Ensure bias matches weight dtype
-            bias = outproj_bias.to(target_dtype) if outproj_bias is not None else None
-            
-            current_out = F.linear(delta, outproj_weight, bias)
-            out = torch.cumsum(current_out, dim=1)
+            if torch.is_autocast_enabled():
+                dtype = torch.get_autocast_gpu_dtype()
+                out, outproj_weight = out.to(dtype), outproj_weight.to(dtype)
+                outproj_bias = outproj_bias.to(dtype) if outproj_bias is not None else None
+            out_prequant_aux = out
+            # out_prev = torch.cat([
+            #         torch.zeros_like(out[:, :1, :]),  # First token has no previous
+            #         out[:, :-1, :]  # Shift by 1 position
+            #     ], dim=1)
+                
+            # delta = out - out_prev
+            # diff_norm = torch.abs(diff)
+            # is_changed = (diff_norm > threshold)
+            # delta = torch.where(is_changed, diff, torch.zeros_like(diff))
+            if insert_quant:
+                if threshold is None:
+                    raise ValueError("threshold must be provided when insert_quant=True")
+                threshold_tensor = threshold_tensor.to(device=out.device, dtype=out.dtype)
+                out_prequant = out_prequant_aux
+                out = torch.round(out_prequant / threshold_tensor) * threshold_tensor
+            if return_activation_sparsity:
+                activation_sparsity = calculate_activation_sparsity(out)  
+            out = F.linear(out, outproj_weight, outproj_bias)
+            # out = torch.cumsum(current_out, dim=1)  
             # out = F.linear(out, outproj_weight, outproj_bias)
+            # regularization_term = (delta.abs()).mean()
+            # Also calculate L2 norm
         else:
             assert outproj_bias is None
         ctx.save_for_backward(zxbcdt, conv1d_weight, conv1d_bias,
-                              out_x, D, initial_states, seq_idx, rmsnorm_weight, rstd, outproj_weight, outproj_bias)
-        # ctx.dt_limit = dt_limit
+                              out_x, A, D, dt_bias, initial_states, seq_idx, rmsnorm_weight, rstd, outproj_weight, outproj_bias, threshold_tensor)
+        ctx.dt_limit = dt_limit
         ctx.return_final_states = return_final_states
         ctx.activation = activation
         ctx.rmsnorm_eps = rmsnorm_eps
@@ -1908,136 +2212,214 @@ class DR_SSM_SplitConv1dScanCombinedFn(torch.autograd.Function):
         ctx.headdim = headdim
         ctx.ngroups = ngroups
         ctx.output_activation = output_activation
+        ctx.return_activation_sparsity = return_activation_sparsity
+        ctx.insert_quant = insert_quant
+        ctx.threshold_requires_grad = isinstance(threshold, torch.Tensor) and threshold.requires_grad
+        #delta
         ctx.threshold = threshold
         # return out if not return_final_states else (out, final_states) if not return_activation_sparsity else (out, final_states, activation_sparsity)
         if not (return_final_states or return_activation_sparsity):
             return out
-        # Reduce sigma_squared_sum to scalar for regularization loss
-        regularization_scalar = sigma_squared_sum.mean()
-        out = (out, regularization_scalar)
+        out = (out, )
         if return_final_states:
             out = out + (final_states, )
         if return_activation_sparsity:
             out = out + (activation_sparsity, )
-        return out
+        # return out + (delta, )
+        return out + (out_prequant_aux, )
 
     @staticmethod
     @custom_bwd
     def backward(ctx, dout, *args):
-        zxbcdt, conv1d_weight, conv1d_bias, out, D, initial_states, seq_idx, rmsnorm_weight, rstd, outproj_weight, outproj_bias = ctx.saved_tensors
-        dfinal_states = args[0] if ctx.return_final_states else None
+        zxbcdt, conv1d_weight, conv1d_bias, out, A, D, dt_bias, initial_states, seq_idx, rmsnorm_weight, rstd, outproj_weight, outproj_bias, threshold_tensor = ctx.saved_tensors
+
+        arg_idx = 0
+        dfinal_states = args[arg_idx] if ctx.return_final_states else None
+        if ctx.return_final_states:
+            arg_idx += 1
+
+        if ctx.return_activation_sparsity:
+            _dactivation_sparsity = args[arg_idx]
+            arg_idx += 1
+
+        ddelta_out = args[arg_idx] if len(args) > arg_idx else None
+
         headdim = ctx.headdim
         nheads = D.shape[0]
         dim = nheads * headdim
-        dstate = (conv1d_weight.shape[0] - dim) // ctx.ngroups // 2
-        d_nonssm = (zxbcdt.shape[-1] - 5 * dim - 2 * ctx.ngroups * dstate) // 2
         assert nheads % ctx.ngroups == 0
-        try:
-            assert zxbcdt.shape == (dout.shape[0], dout.shape[1], 2 * d_nonssm + 5 * dim + 2 * ctx.ngroups * dstate)
-        except AssertionError as e:
-            print("Shape mismatch in backward:", zxbcdt.shape)
-        
+        dstate = (conv1d_weight.shape[0] - dim) // ctx.ngroups // 2
+        d_nonssm = (zxbcdt.shape[-1] - 2 * dim - 2 * ctx.ngroups * dstate - nheads) // 2
         assert d_nonssm >= 0
-        recompute_output = outproj_weight is not None
-        if recompute_output:
-            out_recompute = torch.empty(*out.shape[:2], d_nonssm + dim, device=out.device, dtype=out.dtype)
-            out0_recompute, out1_recompute = out_recompute.split([d_nonssm, dim], dim=-1)
-        zx0, z, E, I, A, xBC = torch.split(zxbcdt, [2 * d_nonssm, dim,dim, dim, dim, dim + 2 * ctx.ngroups * dstate], dim=-1)
-        # Recompute x, B, C
-        xBC_conv = rearrange(
-            causal_conv1d_fwd_function(rearrange_and_update_stride(xBC, "b s d -> b d s"),
-                                       conv1d_weight, conv1d_bias, seq_idx, None, None, True if ctx.activation in ["silu", "swish"] else False),
-            "b d s -> b s d"
-        )
-        x, B, C = torch.split(xBC_conv, [dim, ctx.ngroups * dstate, ctx.ngroups * dstate], dim=-1)
-        x = rearrange(x, "b l (h p) -> b l h p", h=nheads)
-        B = rearrange(B, "b l (g n) -> b l g n", g=ctx.ngroups)
-        C = rearrange(C, "b l (g n) -> b l g n", g=ctx.ngroups)
-        E = rearrange(E, "b l (h p) -> b l h p", h=nheads)
-        I = rearrange(I, "b l (h p) -> b l h p", h=nheads)
-        A = rearrange(A, "b l (h p) -> b l h p", h=nheads)
-        A = -F.softplus(A)
-        E = F.relu(E)
-        I = F.softplus(I)
-        
-        dzxbcdt = torch.empty_like(zxbcdt)
-        dzx0, dz,dE_given, dI_given, dA_given, dxBC_given = torch.split(dzxbcdt, [2 * d_nonssm, dim,dim, dim, dim, dim + 2 * ctx.ngroups * dstate], dim=-1)
-        dxBC = torch.empty_like(xBC)
-        dx, dB, dC = torch.split(dxBC, [dim, ctx.ngroups * dstate, ctx.ngroups * dstate], dim=-1)
+
+        zx0, z, xBC, dt = torch.split(zxbcdt, [2 * d_nonssm, dim, dim + 2 * ctx.ngroups * dstate, nheads], dim=-1)
         z = rearrange(z, "b l (h p) -> b l h p", h=nheads)
-        dx = rearrange(dx, "b l (h p) -> b l h p", h=nheads)
-        dB = rearrange(dB, "b l (g n) -> b l g n", g=ctx.ngroups)
-        dC = rearrange(dC, "b l (g n) -> b l g n", g=ctx.ngroups)
-        dE = rearrange(dE_given, "b l (h p) -> b l h p", h=nheads)
-        dI = rearrange(dI_given, "b l (h p) -> b l h p", h=nheads)
-        dA = rearrange(dA_given, "b l (h p) -> b l h p", h=nheads)
-        
-        
-        dcurrent_out = None
-        delta = None
+
+        dthreshold = None
+        dout_og = None
+        linear_input = None
+        dlinear_direct = None
+
+        # Old delta/cumsum backward path kept for reference:
+        # dcurrent_out = None
+        # delta = None
+        # ddelta_from_out = None
+        #
+        # if outproj_weight is not None:
+        #     dout_og = dout
+        #
+        #     if rmsnorm_weight is None:
+        #         out_for_delta = rearrange(out, "b s h p -> b s (h p)")
+        #         if d_nonssm > 0:
+        #             if ctx.activation in ["silu", "swish"]:
+        #                 nonssm_out = _swiglu_fwd(zx0)
+        #             else:
+        #                 nonssm_out = _reglu_fwd(zx0)
+        #             out_for_delta = torch.cat([nonssm_out, out_for_delta], dim=-1)
+        #     else:
+        #         x_rms = rearrange(out, "b s h p -> (b s) (h p)")
+        #         z_rms = rearrange(z, "b s h p -> (b s) (h p)")
+        #
+        #         if d_nonssm == 0:
+        #             out_for_delta_temp = None
+        #         else:
+        #             batch = out.shape[0]
+        #             seqlen = out.shape[1]
+        #             out_for_delta_01 = torch.empty((batch, seqlen, d_nonssm + dim), device=out.device, dtype=out.dtype)
+        #             out_for_delta_temp = rearrange(out_for_delta_01[..., d_nonssm:], "b s d -> (b s) d")
+        #             if ctx.activation in ["silu", "swish"]:
+        #                 out_for_delta_01[..., :d_nonssm] = _swiglu_fwd(zx0, out=out_for_delta_01[..., :d_nonssm])
+        #             elif ctx.activation == "relu":
+        #                 out_for_delta_01[..., :d_nonssm] = _reglu_fwd(zx0, out=out_for_delta_01[..., :d_nonssm])
+        #
+        #         out_for_delta_temp, _, _ = _layer_norm_fwd(
+        #             x_rms,
+        #             rmsnorm_weight,
+        #             None,
+        #             ctx.rmsnorm_eps,
+        #             z_rms,
+        #             out=out_for_delta_temp,
+        #             group_size=dim // ctx.ngroups,
+        #             norm_before_gate=ctx.norm_before_gate,
+        #             is_rms_norm=True,
+        #         )
+        #         if d_nonssm == 0:
+        #             out_for_delta = rearrange(out_for_delta_temp, "(b s) d -> b s d", b=out.shape[0])
+        #         else:
+        #             out_for_delta = out_for_delta_01
+        #
+        #     out_prev = torch.cat([
+        #         torch.zeros_like(out_for_delta[:, :1, :]),
+        #         out_for_delta[:, :-1, :]
+        #     ], dim=1)
+        #     delta = out_for_delta - out_prev
+        #
+        #     dcurrent_out = torch.flip(torch.cumsum(torch.flip(dout_og, dims=[1]), dim=1), dims=[1])
+        #     ddelta_from_out = F.linear(dcurrent_out, outproj_weight.t())
+        #
+        # ddelta_total = ddelta_from_out
+        # if ddelta_out is not None:
+        #     ddelta_total = ddelta_out if ddelta_total is None else (ddelta_total + ddelta_out)
+        #
+        # if ddelta_total is not None:
+        #     dout_from_delta = ddelta_total.clone()
+        #     dout_prev = -ddelta_total
+        #     dout_from_delta[:, :-1, :] += dout_prev[:, 1:, :]
+        #     if outproj_weight is not None:
+        #         dout = dout_from_delta
+        #     else:
+        #         dout = dout + dout_from_delta
+
         if outproj_weight is not None:
             dout_og = dout
-            
-            # Recompute the actual input to output projection (after RMSNorm/gating)
+
             if rmsnorm_weight is None:
-                # No RMSNorm case: out_x was just rearranged and possibly concatenated with non-SSM
-                out_for_delta = rearrange(out, "b s h p -> b s (h p)")
+                linear_input = rearrange(out, "b s h p -> b s (h p)")
                 if d_nonssm > 0:
-                    # Recompute non-SSM part
                     if ctx.activation in ["silu", "swish"]:
                         nonssm_out = _swiglu_fwd(zx0)
                     else:
                         nonssm_out = _reglu_fwd(zx0)
-                    out_for_delta = torch.cat([nonssm_out, out_for_delta], dim=-1)
+                    linear_input = torch.cat([nonssm_out, linear_input], dim=-1)
             else:
-                # RMSNorm case: need to recompute RMSNorm output
                 x_rms = rearrange(out, "b s h p -> (b s) (h p)")
                 z_rms = rearrange(z, "b s h p -> (b s) (h p)")
-                
+
                 if d_nonssm == 0:
-                    out_for_delta_temp = None
+                    linear_input_temp = None
                 else:
                     batch = out.shape[0]
                     seqlen = out.shape[1]
-                    out_for_delta_01 = torch.empty((batch, seqlen, d_nonssm + dim), device=out.device, dtype=out.dtype)
-                    out_for_delta_temp = rearrange(out_for_delta_01[..., d_nonssm:], "b s d -> (b s) d")
+                    linear_input_01 = torch.empty((batch, seqlen, d_nonssm + dim), device=out.device, dtype=out.dtype)
+                    linear_input_temp = rearrange(linear_input_01[..., d_nonssm:], "b s d -> (b s) d")
                     if ctx.activation in ["silu", "swish"]:
-                        out_for_delta_01[..., :d_nonssm] = _swiglu_fwd(zx0, out=out_for_delta_01[..., :d_nonssm])
+                        linear_input_01[..., :d_nonssm] = _swiglu_fwd(zx0, out=linear_input_01[..., :d_nonssm])
                     elif ctx.activation == "relu":
-                        out_for_delta_01[..., :d_nonssm] = _reglu_fwd(zx0, out=out_for_delta_01[..., :d_nonssm])
-                
-                out_for_delta_temp, _, _ = _layer_norm_fwd(x_rms, rmsnorm_weight, None, ctx.rmsnorm_eps, z_rms, 
-                                                             out=out_for_delta_temp, group_size=dim//ctx.ngroups,
-                                                             norm_before_gate=ctx.norm_before_gate, is_rms_norm=True)
+                        linear_input_01[..., :d_nonssm] = _reglu_fwd(zx0, out=linear_input_01[..., :d_nonssm])
+
+                linear_input_temp, _, _ = _layer_norm_fwd(
+                    x_rms,
+                    rmsnorm_weight,
+                    None,
+                    ctx.rmsnorm_eps,
+                    z_rms,
+                    out=linear_input_temp,
+                    group_size=dim // ctx.ngroups,
+                    norm_before_gate=ctx.norm_before_gate,
+                    is_rms_norm=True,
+                )
                 if d_nonssm == 0:
-                    out_for_delta = rearrange(out_for_delta_temp, "(b s) d -> b s d", b=out.shape[0])
+                    linear_input = rearrange(linear_input_temp, "(b s) d -> b s d", b=out.shape[0])
                 else:
-                    out_for_delta = out_for_delta_01
-            
-            # Recompute delta from the correct pre-projection tensor
-            out_prev = torch.cat([
-                torch.zeros_like(out_for_delta[:, :1, :]),
-                out_for_delta[:, :-1, :]
-            ], dim=1)
-            diff = out_for_delta - out_prev
-            is_changed = (torch.abs(diff) > ctx.threshold).float()
-            delta = diff * is_changed
-            
-            # Backprop through cumsum: gradient of cumsum is reverse cumsum
-            dcurrent_out = torch.flip(torch.cumsum(torch.flip(dout_og, dims=[1]), dim=1), dims=[1])
-            
-            # Backprop through linear projection
-            ddelta = F.linear(dcurrent_out, outproj_weight.t())
-            
-            # Backprop through masking
-            ddiff = ddelta * is_changed
-            
-            # Backprop through diff = out - out_prev
-            dout = ddiff.clone()
-            dout_prev = -ddiff
-            dout[:, :-1, :] += dout_prev[:, 1:, :]
+                    linear_input = linear_input_01
+
+            dout = F.linear(dout_og, outproj_weight.t())
+            dlinear_direct = ddelta_out
+            if ctx.insert_quant:
+                threshold_tensor = threshold_tensor.to(device=linear_input.device, dtype=linear_input.dtype)
+                scaled = linear_input / threshold_tensor
+                rounded = torch.round(scaled)
+                dquant = dout
+                dq_dthreshold = rounded - linear_input / threshold_tensor
+                if ctx.threshold_requires_grad:
+                    dthreshold = (dquant * dq_dthreshold).sum_to_size(threshold_tensor.shape)
+                dout = dquant
+                linear_input = rounded * threshold_tensor
+            if dlinear_direct is not None:
+                dout = dout + dlinear_direct
         
+        # Standard backward pass setup
+        recompute_output = outproj_weight is not None
+        if recompute_output:
+            out_recompute = torch.empty(*out.shape[:2], d_nonssm + dim, device=out.device, dtype=out.dtype)
+            out0_recompute, out1_recompute = out_recompute.split([d_nonssm, dim], dim=-1)
         
+        # Recompute x, B, C
+        xBC_old = xBC
+        xBC = F.silu(xBC) if ctx.activation in ["silu", "swish"] else xBC
+        x, B, C = torch.split(xBC, [dim, ctx.ngroups * dstate, ctx.ngroups * dstate], dim=-1)
+        x = rearrange(x, "b l (h p) -> b l h p", h=nheads)
+        B = rearrange(B, "b l (g n) -> b l g n", g=ctx.ngroups)
+        C = rearrange(C, "b l (g n) -> b l g n", g=ctx.ngroups)
+        # xBC_conv = rearrange(
+        #     causal_conv1d_fwd_function(rearrange_and_update_stride(xBC, "b s d -> b d s"),
+        #                                conv1d_weight, conv1d_bias, seq_idx, None, None, True if ctx.activation in ["silu", "swish"] else False),
+        #     "b d s -> b s d"
+        # )
+        # x, B, C = torch.split(xBC_conv, [dim, ctx.ngroups * dstate, ctx.ngroups * dstate], dim=-1)
+        # x = rearrange(x, "b l (h p) -> b l h p", h=nheads)
+        # B = rearrange(B, "b l (g n) -> b l g n", g=ctx.ngroups)
+        # C = rearrange(C, "b l (g n) -> b l g n", g=ctx.ngroups)
+        
+        dzxbcdt = torch.empty_like(zxbcdt)
+        dzx0, dz, dxBC_given, ddt_given = torch.split(dzxbcdt, [2 * d_nonssm, dim, dim + 2 * ctx.ngroups * dstate, nheads], dim=-1)
+        dxBC = torch.empty_like(xBC)
+        dx, dB, dC = torch.split(dxBC, [dim, ctx.ngroups * dstate, ctx.ngroups * dstate], dim=-1)
+        dx = rearrange(dx, "b l (h p) -> b l h p", h=nheads)
+        dB = rearrange(dB, "b l (g n) -> b l g n", g=ctx.ngroups)
+        dC = rearrange(dC, "b l (g n) -> b l g n", g=ctx.ngroups)
+        
+        # Split gradient for non-SSM and SSM components
         if d_nonssm > 0:
             dout0, dout = dout.split([d_nonssm, dim], dim=-1)
             if ctx.activation in ["silu", "swish"]:
@@ -2046,10 +2428,12 @@ class DR_SSM_SplitConv1dScanCombinedFn(torch.autograd.Function):
                 _reglu_bwd(zx0, dout0, dxy=dzx0, recompute_output=True, out=out0_recompute)
         
         dout = rearrange(dout, "b s (h p) -> b s h p", p=headdim)
+        
+        # Backward through RMSNorm/gating and Mamba SSM
         if rmsnorm_weight is None:
             dz = rearrange(dz, "b l (h p) -> b l h p", h=nheads)
             dx, ddt, dA, dB, dC, dD, dz, ddt_bias, dinitial_states, *rest = _mamba_chunk_scan_combined_bwd(
-                dout, x, dt, A, B, C, out, ctx.chunk_size, D=D, z=z, dt_bias=dt_bias, initial_states=initial_states, dfinal_states=dfinal_states, seq_idx=seq_idx, dt_softplus=True, dt_limit=ctx.dt_limit, dx=dx, ddt=ddt_given, dB=dB, dC=dC, dz=dz, recompute_output=recompute_output, output_activation=ctx.output_activation, threshold=ctx.threshold
+                dout, x, dt, A, B, C, out, ctx.chunk_size, D=D, z=z, dt_bias=dt_bias, initial_states=initial_states, dfinal_states=dfinal_states, seq_idx=seq_idx, dt_softplus=True, dt_limit=ctx.dt_limit, dx=dx, ddt=ddt_given, dB=dB, dC=dC, dz=dz, recompute_output=recompute_output, output_activation=ctx.output_activation
             )
             out_for_linear = rearrange(rest[0], "b s h p -> b s (h p)") if recompute_output else None
             drmsnorm_weight = None
@@ -2060,41 +2444,52 @@ class DR_SSM_SplitConv1dScanCombinedFn(torch.autograd.Function):
             x_rms = rearrange(out, "b s h p -> (b s) (h p)")
             z_rms = rearrange(z, "b s h p -> (b s) (h p)")
             out1_recompute = rearrange(out1_recompute, "b s d -> (b s) d") if recompute_output else None
-            # backward through rmsnorm
             dout, drmsnorm_weight, _, dz, *rest = _layer_norm_bwd(dy_rms, x_rms, rmsnorm_weight, None, ctx.rmsnorm_eps, None, rstd, z_rms, group_size=dim//ctx.ngroups, norm_before_gate=ctx.norm_before_gate, is_rms_norm=True, recompute_output=recompute_output, dz=dz, out=out1_recompute if recompute_output else None)
             out_for_linear = out_recompute if recompute_output else None
             dout = rearrange(dout, "(b s) (h p) -> b s h p", b=batch, p=headdim)
-            dx, dA, dB, dC, dD, _, dE,dI, dinitial_states = _dr_ssm_chunk_scan_combined_bwd(
-                dout, x, A, B, C,E, I, out, ctx.chunk_size, D=D, z=None, initial_states=initial_states, dfinal_states=dfinal_states, seq_idx=seq_idx,  dx=dx, dB=dB, dC=dC,dE = dE, dI = dI, dA = dA, output_activation=ctx.output_activation, threshold=ctx.threshold
+            dx, ddt, dA, dB, dC, dD, _, ddt_bias, dinitial_states = _mamba_chunk_scan_combined_bwd(
+                dout, x, dt, A, B, C, out, ctx.chunk_size, D=D, z=None, dt_bias=dt_bias, initial_states=initial_states, dfinal_states=dfinal_states, seq_idx=seq_idx, dt_softplus=True, dt_limit=ctx.dt_limit, dx=dx, ddt=ddt_given, dB=dB, dC=dC, output_activation=ctx.output_activation
             )
-            
 
-        
+        # Compute output projection weight gradients
         if outproj_weight is not None:
-            doutproj_weight = torch.einsum("bso,bsd->od", dcurrent_out, delta.to(dcurrent_out.dtype))
-            doutproj_bias = dcurrent_out.sum(dim=(0, 1)) if outproj_bias is not None else None
+            # Old delta-based projection gradients kept for reference:
+            # if delta.dtype != dcurrent_out.dtype:
+            #     delta = delta.to(dcurrent_out.dtype)
+            #
+            # doutproj_weight = torch.einsum("bso,bsd->od", dcurrent_out, delta)
+            # doutproj_bias = dcurrent_out.sum(dim=(0, 1)) if outproj_bias is not None else None
+            linear_input_for_grad = linear_input
+            if linear_input_for_grad.dtype != dout_og.dtype:
+                linear_input_for_grad = linear_input_for_grad.to(dout_og.dtype)
+            doutproj_weight = torch.einsum("bso,bsd->od", dout_og, linear_input_for_grad)
+            doutproj_bias = dout_og.sum(dim=(0, 1)) if outproj_bias is not None else None
         else:
             doutproj_weight, doutproj_bias = None, None
-            
-        dxBC_given = rearrange(dxBC_given, "b s d -> b d s")
-        dxBC_given_update, dweight, dbias, *_ = causal_conv1d_bwd_function(
-            rearrange_and_update_stride(xBC, "b s d -> b d s"), conv1d_weight, conv1d_bias,
-            rearrange(dxBC, "b s d -> b d s"), seq_idx, None, None, rearrange_and_update_stride(dxBC_given), False, True if ctx.activation in ["silu", "swish"] else False
-        )
-        if dxBC_given.stride() != dxBC_given_update.stride():
-            dxBC_given.copy_(dxBC_given_update)
-        else:
-            dxBC_given = dxBC_given_update
-        dxBC_given = rearrange(dxBC_given, "b d s -> b s d")
+
         
-        dI = dI * torch.sigmoid(I)
-        dE = dE * (E > 0).float()
-        dA = - dA * torch.sigmoid(-A)
+        # Backward through conv1d
+        # dxBC_given = rearrange(dxBC_given, "b s d -> b d s")
+        # dxBC_given_update, dweight, dbias, *_ = causal_conv1d_bwd_function(
+        #     rearrange_and_update_stride(xBC, "b s d -> b d s"), conv1d_weight, conv1d_bias,
+        #     rearrange(dxBC, "b s d -> b d s"), seq_idx, None, None, rearrange_and_update_stride(dxBC_given), False, True if ctx.activation in ["silu", "swish"] else False
+        # )
+        # if dxBC_given.stride() != dxBC_given_update.stride():
+        #     dxBC_given.copy_(dxBC_given_update)
+        # else:
+        #     dxBC_given = dxBC_given_update
+        # dxBC_given = rearrange(dxBC_given, "b d s -> b s d")
         
-        return dzxbcdt, dweight, dbias, dD, None, dinitial_states, None, None, None, drmsnorm_weight, None, doutproj_weight, doutproj_bias, None, None, None, None, None, None
+        dxBC = dxBC * F.sigmoid(xBC_old) * ( 1 + xBC_old * (1 - F.sigmoid(xBC_old))) if ctx.activation in ["silu", "swish"] else dxBC
+        dxBC_given.copy_(dxBC)
+        dweight, dbias = torch.zeros_like(conv1d_weight), torch.zeros_like(conv1d_bias)
+
+        
+
+        return dzxbcdt, dweight, dbias, ddt_bias, dA, dD, None, dinitial_states, None, None, None, None, drmsnorm_weight, None, doutproj_weight, doutproj_bias, None, None, None, None, None, dthreshold, None
 
 
-def DR_SSM_split_conv1d_scan_combined(zxbcdt, conv1d_weight, conv1d_bias, dt_bias,  chunk_size, initial_states=None, seq_idx=None, dt_limit=(0.0, float("inf")), return_final_states=False, activation="silu", rmsnorm_weight=None, rmsnorm_eps=1e-6, outproj_weight=None, outproj_bias=None, headdim=None, ngroups=1, norm_before_gate=True, return_activation_sparsity = False, output_activation = None, threshold = None):
+def mamba_split_conv1d_scan_combined_Delta(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states=None, seq_idx=None, dt_limit=(0.0, float("inf")), return_final_states=False, activation="silu", rmsnorm_weight=None, rmsnorm_eps=1e-6, outproj_weight=None, outproj_bias=None, headdim=None, ngroups=1, norm_before_gate=True, return_activation_sparsity = False, output_activation = None, threshold = None, insert_quant = False):
     """
     Argument:
         zxbcdt: (batch, seqlen, 2 * dim + 2 * ngroups * dstate + nheads) where dim == nheads * headdim
@@ -2113,7 +2508,8 @@ def DR_SSM_split_conv1d_scan_combined(zxbcdt, conv1d_weight, conv1d_bias, dt_bia
     Return:
         out: (batch, seqlen, dim)
     """
-    return DR_SSM_SplitConv1dScanCombinedFn.apply(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states, seq_idx,  return_final_states, activation, rmsnorm_weight, rmsnorm_eps, outproj_weight, outproj_bias, headdim, ngroups, norm_before_gate, return_activation_sparsity, output_activation, threshold)
+    return MambaSplitConv1dScanCombinedDeltaFn.apply(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states, seq_idx, dt_limit, return_final_states, activation, rmsnorm_weight, rmsnorm_eps, outproj_weight, outproj_bias, headdim, ngroups, norm_before_gate, return_activation_sparsity, output_activation, threshold, insert_quant)
+
 
 
 
